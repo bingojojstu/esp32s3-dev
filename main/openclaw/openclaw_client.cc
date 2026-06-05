@@ -193,14 +193,40 @@ void OpenclawClient::ParseSseLine(const std::string& line) {
 void OpenclawClient::DispatchEvent() {
     if (current_data_.empty() && current_event_.empty()) return;
 
-    // Stream terminators — different endpoints signal "end of response"
-    // differently:
-    //   /v1/responses  -> "data: [DONE]"
-    //   /v1/vision     -> "event: response.completed"
-    // We accept either so the same parser works for both. (HTTP body
-    // closure is a third implicit signal; on_done in the caller fires
-    // regardless of which terminator hit.)
-    if (current_data_ == "[DONE]" || current_event_ == "response.completed") {
+    // Stream terminators. We accept any of:
+    //   data: [DONE]              ← OpenAI-compat, /v1/responses uses this
+    //   event: response.completed ← OpenAI Responses canonical, /v1/vision
+    //   event: response.failed    ← OpenAI Responses error terminator
+    //   event: error              ← generic SSE error
+    //
+    // The last two also surface the error message via on_error so the UI
+    // gets a "what went wrong" toast instead of just an empty reply.
+    if (current_data_ == "[DONE]" ||
+        current_event_ == "response.completed") {
+        done_ = true;
+        current_event_.clear();
+        current_data_.clear();
+        return;
+    }
+    if (current_event_ == "response.failed" ||
+        current_event_ == "error") {
+        // Try to dig out a human-readable message from the data JSON.
+        std::string msg = "server reported '" + current_event_ + "'";
+        if (!current_data_.empty()) {
+            cJSON* root = cJSON_Parse(current_data_.c_str());
+            if (root) {
+                cJSON* err = cJSON_GetObjectItem(root, "error");
+                if (err) {
+                    cJSON* m = cJSON_GetObjectItem(err, "message");
+                    if (cJSON_IsString(m) && m->valuestring) {
+                        msg = m->valuestring;
+                    }
+                }
+                cJSON_Delete(root);
+            }
+        }
+        ESP_LOGE(TAG, "stream terminated by server: %s", msg.c_str());
+        if (cb_.on_error) cb_.on_error(msg);
         done_ = true;
         current_event_.clear();
         current_data_.clear();
