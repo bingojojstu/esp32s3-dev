@@ -828,6 +828,14 @@ void Application::HandleStopListeningEvent() {
 }
 
 void Application::HandleWakeWordDetectedEvent() {
+#ifdef CONFIG_USE_OPENCLAW_WAKE_WORD
+    // Hands-free voice: a wake word event triggers the same path as a
+    // BOOT long-press. StartOpenclawVoice() is re-entrancy-guarded so a
+    // wake firing while a request is in flight is safely dropped.
+    ESP_LOGI(TAG, "Wake word detected — starting OpenClaw voice worker");
+    StartOpenclawVoice();
+    return;
+#endif
     if (!protocol_) {
         return;
     }
@@ -1197,13 +1205,14 @@ static std::atomic<bool> g_openclaw_in_flight{false};
 static std::atomic<bool> g_voice_recording{false};
 
 #ifdef CONFIG_USE_OPENCLAW_VISION
-// Parallel capture state. StartOpenclawVoice spawns a small task that
-// grabs a single JPEG snapshot from the camera; the voice worker checks
-// these once STT comes back to decide whether to attach the image.
-static std::vector<uint8_t> g_capture_jpeg;
-static std::mutex           g_capture_mutex;
-static std::atomic<bool>    g_capture_done{false};
-static std::atomic<bool>    g_capture_ok{false};
+// Live-preview state. The preview task runs while recording: it calls
+// Camera::Capture() in a loop, which in turn pushes the frame into the
+// LcdDisplay's preview widget via SetPreviewImage (see Capture() code).
+// When the voice worker is ready to stop, it clears g_preview_active.
+// The task sets g_preview_running back to false on exit so the worker
+// knows it can safely call CaptureToJpeg() without racing on current_fb_.
+static std::atomic<bool> g_preview_active{false};
+static std::atomic<bool> g_preview_running{false};
 
 // Returns true if any of CONFIG_OPENCLAW_VISION_KEYWORDS appears as a
 // substring in `text`. Whitespace around tokens is trimmed.
@@ -1214,13 +1223,10 @@ static bool TextHasVisionKeyword(const std::string& text) {
     }
     const char* p = kKeywords;
     while (*p) {
-        // Find next comma or end.
         const char* end = strchr(p, ',');
         if (end == nullptr) end = p + strlen(p);
-        // Trim leading whitespace.
         while (p < end && (*p == ' ' || *p == '\t')) ++p;
         const char* tok_end = end;
-        // Trim trailing whitespace.
         while (tok_end > p && (tok_end[-1] == ' ' || tok_end[-1] == '\t')) --tok_end;
         if (tok_end > p) {
             std::string token(p, tok_end - p);
@@ -1234,9 +1240,7 @@ static bool TextHasVisionKeyword(const std::string& text) {
     return false;
 }
 
-// Wrap raw JPEG bytes in an OpenAI-style data URL:
-//   data:image/jpeg;base64,/9j/4AAQ...
-// Encoded via mbedtls_base64_encode (zero deps already linked).
+// Wrap raw JPEG bytes in an OpenAI-style data URL.
 static std::string JpegToDataUrl(const std::vector<uint8_t>& jpeg) {
     static const char kPrefix[] = "data:image/jpeg;base64,";
     if (jpeg.empty()) return "";
@@ -1257,67 +1261,74 @@ static std::string JpegToDataUrl(const std::vector<uint8_t>& jpeg) {
     return out;
 }
 
-static void OpenclawCaptureWorker(void*) {
+// Camera preview task: loops Capture() at the configured FPS. Camera's
+// own Capture() implementation calls display->SetPreviewImage so the LCD
+// reflects what the camera sees in near-real-time without any extra
+// plumbing here. Exits cleanly when g_preview_active goes false.
+static void OpenclawPreviewTask(void*) {
     auto* camera = Board::GetInstance().GetCamera();
     if (camera == nullptr) {
-        ESP_LOGW("Application", "No camera available; skipping vision capture");
-        g_capture_done.store(true);
+        g_preview_running.store(false);
         vTaskDelete(nullptr);
         return;
     }
-    std::vector<uint8_t> jpeg;
-    bool ok = camera->CaptureToJpeg(jpeg);
-    {
-        std::lock_guard<std::mutex> lock(g_capture_mutex);
-        g_capture_jpeg = std::move(jpeg);
+    const int frame_period_ms = 1000 / CONFIG_OPENCLAW_PREVIEW_FPS;
+    while (g_preview_active.load()) {
+        if (!camera->Capture()) {
+            // Camera transiently failed — back off briefly and try again.
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        vTaskDelay(pdMS_TO_TICKS(frame_period_ms));
     }
-    g_capture_ok.store(ok);
-    g_capture_done.store(true);
-    ESP_LOGI("Application", "vision capture %s, %u bytes",
-             ok ? "ok" : "failed",
-             static_cast<unsigned>(g_capture_jpeg.size()));
+    g_preview_running.store(false);
     vTaskDelete(nullptr);
 }
 
-// Block (up to timeout) until the parallel capture task finishes, then
-// return the JPEG data URL if it succeeded and the text contains a
-// vision keyword. Otherwise returns "".
-// Always clears the global buffer at the end so the next BOOT press starts
-// clean.
-static std::string MaybeExtractVisionDataUrl(const std::string& stt_text,
-                                             int wait_ms) {
-    std::string out;
-    if (TextHasVisionKeyword(stt_text)) {
-        // Poll g_capture_done with a small sleep — wait_ms cap so we don't
-        // block forever if the capture task crashed.
-        const int step = 20;
-        int waited = 0;
-        while (!g_capture_done.load() && waited < wait_ms) {
-            vTaskDelay(pdMS_TO_TICKS(step));
-            waited += step;
-        }
-        if (!g_capture_done.load()) {
-            ESP_LOGW("Application",
-                     "vision capture not done after %d ms, sending text only",
-                     wait_ms);
-        } else if (g_capture_ok.load()) {
-            std::lock_guard<std::mutex> lock(g_capture_mutex);
-            out = JpegToDataUrl(g_capture_jpeg);
-            ESP_LOGI("Application",
-                     "Attaching image: %u bytes raw JPEG -> %u bytes data url",
-                     static_cast<unsigned>(g_capture_jpeg.size()),
-                     static_cast<unsigned>(out.size()));
-        }
+// Called by the voice worker AFTER recording finishes. Stops the preview
+// task, captures one final frame to JPEG, and returns a data URL if the
+// vision path should be used.
+//
+// Vision path is used when:
+//   * CONFIG_OPENCLAW_ALWAYS_ATTACH_IMAGE is set, OR
+//   * the STT transcript contains a vision keyword.
+static std::string FinalizeVisionAfterRecording(const std::string& stt_text) {
+    // Tell preview to stop and wait for it.
+    g_preview_active.store(false);
+    int waited = 0;
+    while (g_preview_running.load() && waited < 500) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        waited += 10;
     }
-    // Cleanup either way so the next round starts fresh.
-    {
-        std::lock_guard<std::mutex> lock(g_capture_mutex);
-        g_capture_jpeg.clear();
-        g_capture_jpeg.shrink_to_fit();
+    if (g_preview_running.load()) {
+        ESP_LOGW("Application",
+                 "preview task didn't exit after 500ms; proceeding anyway");
     }
-    g_capture_done.store(false);
-    g_capture_ok.store(false);
-    return out;
+
+#ifdef CONFIG_OPENCLAW_ALWAYS_ATTACH_IMAGE
+    const bool want_image = true;
+#else
+    const bool want_image = TextHasVisionKeyword(stt_text);
+#endif
+    if (!want_image) return "";
+
+    auto* camera = Board::GetInstance().GetCamera();
+    if (camera == nullptr) return "";
+
+    // One last fresh capture so the JPEG matches "what user was pointing
+    // at when they finished talking" — the preview task may have updated
+    // mid-utterance.
+    std::vector<uint8_t> jpeg;
+    if (!camera->CaptureToJpeg(jpeg) || jpeg.empty()) {
+        ESP_LOGW("Application", "final vision capture failed");
+        return "";
+    }
+    std::string url = JpegToDataUrl(jpeg);
+    ESP_LOGI("Application",
+             "Attaching image: %u bytes raw JPEG -> %u bytes data url",
+             static_cast<unsigned>(jpeg.size()),
+             static_cast<unsigned>(url.size()));
+    return url;
 }
 #endif  // CONFIG_USE_OPENCLAW_VISION
 
@@ -1480,29 +1491,98 @@ static constexpr int kVoiceMaxSeconds     = 15;
 static constexpr int kVoiceMaxSamples     = kVoiceSampleRate * kVoiceMaxSeconds;
 static constexpr int kVoiceMinSamples     = kVoiceSampleRate / 4;  // 0.25 s
 
+// Per-chunk average of |sample|. Cheap proxy for RMS for energy VAD.
+static int AverageAbsSample(const std::vector<int16_t>& chunk) {
+    if (chunk.empty()) return 0;
+    int64_t sum = 0;
+    for (int16_t s : chunk) sum += (s < 0 ? -s : s);
+    return static_cast<int>(sum / chunk.size());
+}
+
 static void OpenclawVoiceWorker(void* arg) {
     auto& app = Application::GetInstance();
     auto& board = Board::GetInstance();
     auto* display = board.GetDisplay();
     auto& audio = app.GetAudioService();
 
+    // -------- Phase 0: own the codec --------------------------------------
+    // If wake-word detection was running it was also reading the codec —
+    // disable it while we record so there's no contention.
+    audio.EnableWakeWordDetection(false);
+
+#ifdef CONFIG_USE_OPENCLAW_VISION
+    // Start the camera preview loop in parallel — it pushes frames into
+    // the LCD's preview widget at CONFIG_OPENCLAW_PREVIEW_FPS so the user
+    // sees what the camera sees while they speak.
+    g_preview_active.store(true);
+    g_preview_running.store(true);
+    if (xTaskCreatePinnedToCore(&OpenclawPreviewTask, "openclaw_cam",
+                                4096 * 2, nullptr, 4, nullptr,
+                                /*core=*/0) != pdPASS) {
+        ESP_LOGW("Application",
+                 "Failed to spawn preview task (continuing without preview)");
+        g_preview_active.store(false);
+        g_preview_running.store(false);
+    }
+#endif
+
     if (display) {
         display->ShowNotification("\xF0\x9F\x8E\xA4 Listening...", 30000);
     }
 
-    // -------- Phase 1: record while the user holds BOOT ----------------
+    // -------- Phase 1: record + inline energy VAD -----------------------
+    // We exit when ANY of the following holds:
+    //   * g_voice_recording is cleared (BOOT release / explicit stop)
+    //   * VAD: at least kVadMinSpeechMs of speech AND kVadSilenceMs of
+    //     trailing silence below the energy threshold
+    //   * Recording length hits the absolute cap (kVoiceMaxSeconds)
     std::vector<int16_t> pcm;
     pcm.reserve(kVoiceMaxSamples);
+
+    constexpr int kChunkMs = (kVoiceChunkSamples * 1000) / kVoiceSampleRate;
+#ifdef CONFIG_USE_OPENCLAW_WAKE_WORD
+    const int kVadThreshold     = CONFIG_OPENCLAW_VAD_RMS_THRESHOLD;
+    const int kVadMinSpeechMs   = CONFIG_OPENCLAW_VAD_MIN_SPEECH_MS;
+    const int kVadSilenceStopMs = CONFIG_OPENCLAW_VAD_SILENCE_MS;
+#else
+    // VAD parameters are #ifdef'd onto USE_OPENCLAW_WAKE_WORD because
+    // their Kconfig entries are too — when wake word is off the worker
+    // is BOOT-only and just runs to user release.
+    const int kVadThreshold     = 0;
+    const int kVadMinSpeechMs   = 0;
+    const int kVadSilenceStopMs = 0;
+#endif
+    const bool vad_enabled = (kVadThreshold > 0);
+
+    int silent_ms = 0;
+    int speech_ms = 0;
 
     while (g_voice_recording.load() &&
            static_cast<int>(pcm.size()) < kVoiceMaxSamples) {
         std::vector<int16_t> chunk;
         if (!audio.ReadAudioData(chunk, kVoiceSampleRate, kVoiceChunkSamples)) {
-            // ReadAudioData turns the codec on lazily; transient failures
-            // can happen during warm-up. Just retry.
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
+
+        if (vad_enabled) {
+            int avg_abs = AverageAbsSample(chunk);
+            if (avg_abs > kVadThreshold) {
+                speech_ms += kChunkMs;
+                silent_ms = 0;
+            } else {
+                silent_ms += kChunkMs;
+            }
+            if (speech_ms >= kVadMinSpeechMs &&
+                silent_ms >= kVadSilenceStopMs) {
+                ESP_LOGI("Application",
+                         "VAD: end of speech (%d ms speech, %d ms silence)",
+                         speech_ms, silent_ms);
+                pcm.insert(pcm.end(), chunk.begin(), chunk.end());
+                break;
+            }
+        }
+
         pcm.insert(pcm.end(), chunk.begin(), chunk.end());
     }
 
@@ -1511,9 +1591,17 @@ static void OpenclawVoiceWorker(void* arg) {
              static_cast<unsigned>(pcm.size()),
              pcm.size() / float(kVoiceSampleRate));
 
+    // Clear the recording flag in case we exited via VAD rather than user
+    // releasing the button — the BOOT-press code path checks it.
+    g_voice_recording.store(false);
+
     if (static_cast<int>(pcm.size()) < kVoiceMinSamples) {
         ESP_LOGW("Application", "Voice clip too short, ignoring");
         if (display) display->ShowNotification("Too short", 2000);
+#ifdef CONFIG_USE_OPENCLAW_VISION
+        g_preview_active.store(false);
+#endif
+        audio.EnableWakeWordDetection(true);
         g_openclaw_in_flight = false;
         vTaskDelete(nullptr);
         return;
@@ -1533,6 +1621,10 @@ static void OpenclawVoiceWorker(void* arg) {
         const char* msg = stt_ok ? "Empty transcription" : "STT failed";
         ESP_LOGW("Application", "%s", msg);
         if (display) display->ShowNotification(msg, 3000);
+#ifdef CONFIG_USE_OPENCLAW_VISION
+        g_preview_active.store(false);
+#endif
+        audio.EnableWakeWordDetection(true);
         g_openclaw_in_flight = false;
         vTaskDelete(nullptr);
         return;
@@ -1543,7 +1635,7 @@ static void OpenclawVoiceWorker(void* arg) {
     // -------- Phase 3: optional vision (camera attachment) -------------
     OpenclawClient::StreamOptions stream_opts;
 #ifdef CONFIG_USE_OPENCLAW_VISION
-    stream_opts.image_data_url = MaybeExtractVisionDataUrl(text, /*wait_ms=*/2000);
+    stream_opts.image_data_url = FinalizeVisionAfterRecording(text);
     if (!stream_opts.image_data_url.empty()) {
         stream_opts.model_override = CONFIG_OPENCLAW_VISION_MODEL;
         if (display) {
@@ -1559,6 +1651,9 @@ static void OpenclawVoiceWorker(void* arg) {
     // -------- Phase 5: TTS playback ------------------------------------
     SpeakOpenclawReply(client, reply, display);
 #endif
+
+    // -------- Phase 6: re-arm wake word for the next utterance ----------
+    audio.EnableWakeWordDetection(true);
 
     g_openclaw_in_flight = false;
     vTaskDelete(nullptr);
@@ -1591,28 +1686,9 @@ void Application::StartOpenclawVoice() {
     }
     g_voice_recording.store(true);
 
-#ifdef CONFIG_USE_OPENCLAW_VISION
-    // Kick off camera capture in parallel with audio recording so the
-    // snapshot is already done by the time STT decides whether to attach
-    // it. Default-priority task on whichever core FreeRTOS picks; not
-    // pinned to core 1 since both image_to_jpeg and the codec read run on
-    // core 1 already and we want them on different cores.
-    g_capture_done.store(false);
-    g_capture_ok.store(false);
-    {
-        std::lock_guard<std::mutex> lock(g_capture_mutex);
-        g_capture_jpeg.clear();
-    }
-    BaseType_t cam_ok = xTaskCreatePinnedToCore(
-        &OpenclawCaptureWorker, "openclaw_cam",
-        4096 * 2, nullptr, 4, nullptr, /*core=*/0);
-    if (cam_ok != pdPASS) {
-        ESP_LOGW("Application",
-                 "Failed to spawn vision capture task (continuing without)");
-        g_capture_done.store(true);  // unblock the worker's wait
-    }
-#endif
-
+    // The voice worker spawns the camera preview task itself (after the
+    // codec is owned), so StartOpenclawVoice doesn't need to do that
+    // here. Wake-word and BOOT paths converge to the same worker.
     BaseType_t ok = xTaskCreate(&OpenclawVoiceWorker, "openclaw_voice",
                                 4096 * 3, nullptr, 4, nullptr);
     if (ok != pdPASS) {

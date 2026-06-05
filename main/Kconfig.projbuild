@@ -1110,6 +1110,83 @@ config OPENCLAW_VISION_MODEL
         OpenClaw deployment recognises: kimi-latest, claude-sonnet-4,
         gpt-4o, etc.
 
+config OPENCLAW_ALWAYS_ATTACH_IMAGE
+    bool "Always attach the camera frame on every wake-triggered query"
+    default n
+    depends on USE_OPENCLAW_VISION
+    help
+        If enabled, every voice query (wake-triggered or BOOT-triggered)
+        sends the latest camera frame to /v1/vision, even when the STT
+        text doesn't contain a vision keyword. Bypass for strategy A.
+        Default off — leave Phase 3b's keyword gate in place to save
+        vision-model calls.
+
+#
+# === Hands-free wake-word integration (Phase 3c) =====================
+# Bridges ESP-SR's wake word detection into the OpenClaw voice path:
+# wake-word event -> spawn voice worker -> energy VAD detects end of
+# speech -> stop recording -> STT -> reply.
+#
+config USE_OPENCLAW_WAKE_WORD
+    bool "Trigger OpenClaw voice path from wake-word events"
+    default y
+    depends on USE_OPENCLAW_BACKEND && (USE_AFE_WAKE_WORD || USE_ESP_WAKE_WORD || USE_CUSTOM_WAKE_WORD)
+    help
+        When enabled, the existing on_wake_word_detected callback
+        starts the OpenClaw voice worker just like a BOOT long-press
+        would. The worker temporarily disables wake-word detection so
+        it owns the microphone, runs an inline energy-threshold VAD,
+        then re-arms wake-word detection on exit.
+
+        BOOT long-press still works in parallel as a backup trigger
+        for quiet environments.
+
+config OPENCLAW_VAD_SILENCE_MS
+    int "Silence duration (ms) to end recording"
+    default 1000
+    range 200 5000
+    depends on USE_OPENCLAW_WAKE_WORD
+    help
+        Once the energy VAD sees this many consecutive milliseconds of
+        sub-threshold audio, recording stops. Too short cuts the user
+        off mid-thought; too long adds latency between "user finishes"
+        and "request goes out".
+
+config OPENCLAW_VAD_MIN_SPEECH_MS
+    int "Minimum speech (ms) required before VAD-end can fire"
+    default 300
+    range 0 3000
+    depends on USE_OPENCLAW_WAKE_WORD
+    help
+        Guard against the worker exiting immediately if there's a quiet
+        moment right after wake word. We require at least this many ms
+        of suprathreshold audio before VAD-end can latch.
+
+config OPENCLAW_VAD_RMS_THRESHOLD
+    int "Energy threshold (avg abs sample value) for VAD"
+    default 800
+    range 100 10000
+    depends on USE_OPENCLAW_WAKE_WORD
+    help
+        Per-chunk average of |sample| above this counts as speech. With
+        a 16-bit signed range (-32768..32767), normal speech sits
+        around 3000-10000 and silence around 50-200. 800 is a
+        reasonable default for the on-board INMP441 mic. Lower this if
+        VAD is cutting you off too early; raise if background noise
+        keeps recording alive forever.
+
+config OPENCLAW_PREVIEW_FPS
+    int "Camera preview frame rate during recording"
+    default 10
+    range 1 30
+    depends on USE_OPENCLAW_VISION
+    help
+        Live camera preview frames are shown on the LCD while recording
+        so the user can see "what the device sees". 10 fps feels smooth
+        without dominating CPU. Raise toward 20 for smoother preview
+        (more CPU, less PSRAM headroom); lower toward 5 to save power.
+
+
 config OPENCLAW_OUTPUT_VOLUME
     int "Speaker output volume (0 = mute, 100 = max)"
     default 100
