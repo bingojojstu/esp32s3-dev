@@ -1181,6 +1181,10 @@ void Application::ResetProtocol() {
 
 #ifdef CONFIG_USE_OPENCLAW_BACKEND
 #include "openclaw_client.h"
+#ifdef CONFIG_USE_OPENCLAW_VISION
+#include <mbedtls/base64.h>
+#include "camera.h"
+#endif
 
 namespace {
 
@@ -1191,6 +1195,131 @@ static std::atomic<bool> g_openclaw_in_flight{false};
 // Voice recording state. Set true by StartOpenclawVoice (BOOT long-press),
 // cleared by StopOpenclawVoice (BOOT release). The worker watches it.
 static std::atomic<bool> g_voice_recording{false};
+
+#ifdef CONFIG_USE_OPENCLAW_VISION
+// Parallel capture state. StartOpenclawVoice spawns a small task that
+// grabs a single JPEG snapshot from the camera; the voice worker checks
+// these once STT comes back to decide whether to attach the image.
+static std::vector<uint8_t> g_capture_jpeg;
+static std::mutex           g_capture_mutex;
+static std::atomic<bool>    g_capture_done{false};
+static std::atomic<bool>    g_capture_ok{false};
+
+// Returns true if any of CONFIG_OPENCLAW_VISION_KEYWORDS appears as a
+// substring in `text`. Whitespace around tokens is trimmed.
+static bool TextHasVisionKeyword(const std::string& text) {
+    static const char* kKeywords = CONFIG_OPENCLAW_VISION_KEYWORDS;
+    if (text.empty() || kKeywords == nullptr || kKeywords[0] == '\0') {
+        return false;
+    }
+    const char* p = kKeywords;
+    while (*p) {
+        // Find next comma or end.
+        const char* end = strchr(p, ',');
+        if (end == nullptr) end = p + strlen(p);
+        // Trim leading whitespace.
+        while (p < end && (*p == ' ' || *p == '\t')) ++p;
+        const char* tok_end = end;
+        // Trim trailing whitespace.
+        while (tok_end > p && (tok_end[-1] == ' ' || tok_end[-1] == '\t')) --tok_end;
+        if (tok_end > p) {
+            std::string token(p, tok_end - p);
+            if (text.find(token) != std::string::npos) {
+                ESP_LOGI("Application", "vision keyword matched: %s", token.c_str());
+                return true;
+            }
+        }
+        p = (*end == '\0') ? end : (end + 1);
+    }
+    return false;
+}
+
+// Wrap raw JPEG bytes in an OpenAI-style data URL:
+//   data:image/jpeg;base64,/9j/4AAQ...
+// Encoded via mbedtls_base64_encode (zero deps already linked).
+static std::string JpegToDataUrl(const std::vector<uint8_t>& jpeg) {
+    static const char kPrefix[] = "data:image/jpeg;base64,";
+    if (jpeg.empty()) return "";
+    size_t need = 0;
+    mbedtls_base64_encode(nullptr, 0, &need, jpeg.data(), jpeg.size());
+    std::string out;
+    out.resize(sizeof(kPrefix) - 1 + need);
+    memcpy(out.data(), kPrefix, sizeof(kPrefix) - 1);
+    size_t written = 0;
+    int rc = mbedtls_base64_encode(
+        reinterpret_cast<unsigned char*>(out.data() + sizeof(kPrefix) - 1),
+        need, &written, jpeg.data(), jpeg.size());
+    if (rc != 0) {
+        ESP_LOGE("Application", "base64 encode failed: %d", rc);
+        return "";
+    }
+    out.resize(sizeof(kPrefix) - 1 + written);
+    return out;
+}
+
+static void OpenclawCaptureWorker(void*) {
+    auto* camera = Board::GetInstance().GetCamera();
+    if (camera == nullptr) {
+        ESP_LOGW("Application", "No camera available; skipping vision capture");
+        g_capture_done.store(true);
+        vTaskDelete(nullptr);
+        return;
+    }
+    std::vector<uint8_t> jpeg;
+    bool ok = camera->CaptureToJpeg(jpeg);
+    {
+        std::lock_guard<std::mutex> lock(g_capture_mutex);
+        g_capture_jpeg = std::move(jpeg);
+    }
+    g_capture_ok.store(ok);
+    g_capture_done.store(true);
+    ESP_LOGI("Application", "vision capture %s, %u bytes",
+             ok ? "ok" : "failed",
+             static_cast<unsigned>(g_capture_jpeg.size()));
+    vTaskDelete(nullptr);
+}
+
+// Block (up to timeout) until the parallel capture task finishes, then
+// return the JPEG data URL if it succeeded and the text contains a
+// vision keyword. Otherwise returns "".
+// Always clears the global buffer at the end so the next BOOT press starts
+// clean.
+static std::string MaybeExtractVisionDataUrl(const std::string& stt_text,
+                                             int wait_ms) {
+    std::string out;
+    if (TextHasVisionKeyword(stt_text)) {
+        // Poll g_capture_done with a small sleep — wait_ms cap so we don't
+        // block forever if the capture task crashed.
+        const int step = 20;
+        int waited = 0;
+        while (!g_capture_done.load() && waited < wait_ms) {
+            vTaskDelay(pdMS_TO_TICKS(step));
+            waited += step;
+        }
+        if (!g_capture_done.load()) {
+            ESP_LOGW("Application",
+                     "vision capture not done after %d ms, sending text only",
+                     wait_ms);
+        } else if (g_capture_ok.load()) {
+            std::lock_guard<std::mutex> lock(g_capture_mutex);
+            out = JpegToDataUrl(g_capture_jpeg);
+            ESP_LOGI("Application",
+                     "Attaching image: %u bytes raw JPEG -> %u bytes data url",
+                     static_cast<unsigned>(g_capture_jpeg.size()),
+                     static_cast<unsigned>(out.size()));
+        }
+    }
+    // Cleanup either way so the next round starts fresh.
+    {
+        std::lock_guard<std::mutex> lock(g_capture_mutex);
+        g_capture_jpeg.clear();
+        g_capture_jpeg.shrink_to_fit();
+    }
+    g_capture_done.store(false);
+    g_capture_ok.store(false);
+    return out;
+}
+#endif  // CONFIG_USE_OPENCLAW_VISION
 
 // Session counter. CONFIG_OPENCLAW_USER is the base; we suffix this counter
 // onto it so the same firmware can start fresh conversations on demand.
@@ -1246,9 +1375,12 @@ static OpenclawClient::Config MakeOpenclawConfig() {
 // Open SSE stream to /v1/responses, accumulate deltas, render final reply,
 // and return the accumulated text so the caller can pipe it on to TTS.
 // Returns an empty string on error / [DONE] with no content.
+// image_data_url: if non-empty, attached to the request — caller checks
+// the STT text for a vision keyword and decides.
 static std::string StreamOpenclawReplyAndDisplay(OpenclawClient& client,
                                                  const std::string& user_text,
-                                                 Display* display) {
+                                                 Display* display,
+                                                 const std::string& image_data_url = "") {
     std::string accumulated;
     uint32_t delta_count = 0;
 
@@ -1275,7 +1407,7 @@ static std::string StreamOpenclawReplyAndDisplay(OpenclawClient& client,
         if (display) display->ShowNotification(msg.c_str(), 5000);
     };
 
-    client.Stream(user_text, cb);
+    client.Stream(user_text, cb, image_data_url);
     return accumulated;
 }
 
@@ -1407,11 +1539,20 @@ static void OpenclawVoiceWorker(void* arg) {
 
     if (display) display->SetChatMessage("user", text.c_str());
 
-    // -------- Phase 3: stream LLM reply (same as text path) ------------
-    std::string reply = StreamOpenclawReplyAndDisplay(client, text, display);
+    // -------- Phase 3: optional vision (camera attachment) -------------
+    std::string image_url;
+#ifdef CONFIG_USE_OPENCLAW_VISION
+    image_url = MaybeExtractVisionDataUrl(text, /*wait_ms=*/2000);
+    if (!image_url.empty() && display) {
+        display->ShowNotification("\xF0\x9F\x91\x80 sending image...", 2000);
+    }
+#endif
+
+    // -------- Phase 4: stream LLM reply --------------------------------
+    std::string reply = StreamOpenclawReplyAndDisplay(client, text, display, image_url);
 
 #ifdef CONFIG_USE_OPENCLAW_TTS
-    // -------- Phase 4: TTS playback ------------------------------------
+    // -------- Phase 5: TTS playback ------------------------------------
     SpeakOpenclawReply(client, reply, display);
 #endif
 
@@ -1445,6 +1586,29 @@ void Application::StartOpenclawVoice() {
         return;
     }
     g_voice_recording.store(true);
+
+#ifdef CONFIG_USE_OPENCLAW_VISION
+    // Kick off camera capture in parallel with audio recording so the
+    // snapshot is already done by the time STT decides whether to attach
+    // it. Default-priority task on whichever core FreeRTOS picks; not
+    // pinned to core 1 since both image_to_jpeg and the codec read run on
+    // core 1 already and we want them on different cores.
+    g_capture_done.store(false);
+    g_capture_ok.store(false);
+    {
+        std::lock_guard<std::mutex> lock(g_capture_mutex);
+        g_capture_jpeg.clear();
+    }
+    BaseType_t cam_ok = xTaskCreatePinnedToCore(
+        &OpenclawCaptureWorker, "openclaw_cam",
+        4096 * 2, nullptr, 4, nullptr, /*core=*/0);
+    if (cam_ok != pdPASS) {
+        ESP_LOGW("Application",
+                 "Failed to spawn vision capture task (continuing without)");
+        g_capture_done.store(true);  // unblock the worker's wait
+    }
+#endif
+
     BaseType_t ok = xTaskCreate(&OpenclawVoiceWorker, "openclaw_voice",
                                 4096 * 3, nullptr, 4, nullptr);
     if (ok != pdPASS) {

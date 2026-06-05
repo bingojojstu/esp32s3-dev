@@ -152,6 +152,77 @@ bool Esp32Camera::SetSwapBytes(bool enabled) {
     return true;
 }
 
+// Synchronous JPEG capture for the OpenClaw VLM path.
+// Runs Capture() to refresh current_fb_, then JPEG-encodes the frame inline
+// (no helper thread; this is called from a dedicated worker task already).
+// On RGB565 boards we reuse the byte-swapped buffer Capture() prepared.
+bool Esp32Camera::CaptureToJpeg(std::vector<uint8_t> &jpeg_bytes) {
+    jpeg_bytes.clear();
+
+    if (!Capture()) {
+        ESP_LOGW(TAG, "CaptureToJpeg: Capture() failed");
+        return false;
+    }
+    if (current_fb_ == nullptr) {
+        return false;
+    }
+
+    // If the sensor is already delivering JPEG (e.g. PIXFORMAT_JPEG), copy
+    // out directly.
+    if (current_fb_->format == PIXFORMAT_JPEG) {
+        jpeg_bytes.assign(current_fb_->buf, current_fb_->buf + current_fb_->len);
+        ESP_LOGI(TAG, "CaptureToJpeg: %u bytes (passthrough)",
+                 static_cast<unsigned>(jpeg_bytes.size()));
+        return true;
+    }
+
+    // Otherwise encode via image_to_jpeg_cb. Pick the right v4l2 format.
+    v4l2_pix_fmt_t enc_fmt;
+    switch (current_fb_->format) {
+        case PIXFORMAT_RGB565:    enc_fmt = V4L2_PIX_FMT_RGB565; break;
+        case PIXFORMAT_YUV422:    enc_fmt = V4L2_PIX_FMT_YUYV;   break;
+        case PIXFORMAT_YUV420:    enc_fmt = V4L2_PIX_FMT_YUV420; break;
+        case PIXFORMAT_GRAYSCALE: enc_fmt = V4L2_PIX_FMT_GREY;   break;
+        case PIXFORMAT_RGB888:    enc_fmt = V4L2_PIX_FMT_RGB24;  break;
+        default:
+            ESP_LOGE(TAG, "CaptureToJpeg: unsupported pixel format %d",
+                     current_fb_->format);
+            return false;
+    }
+
+    uint8_t *src_buf = current_fb_->buf;
+    size_t   src_len = current_fb_->len;
+    if (current_fb_->format == PIXFORMAT_RGB565 && encode_buf_ != nullptr) {
+        src_buf = encode_buf_;
+        src_len = encode_buf_size_;
+    }
+
+    int64_t t0 = esp_timer_get_time();
+    jpeg_bytes.reserve(80 * 1024);   // ~80 KB typical for VGA JPEG q=80
+    bool ok = image_to_jpeg_cb(
+        src_buf, src_len, current_fb_->width, current_fb_->height,
+        enc_fmt, /*quality=*/80,
+        [](void* arg, size_t /*index*/, const void* data, size_t len) -> size_t {
+            auto* out = static_cast<std::vector<uint8_t>*>(arg);
+            if (data != nullptr && len > 0) {
+                const uint8_t* bytes = static_cast<const uint8_t*>(data);
+                out->insert(out->end(), bytes, bytes + len);
+            }
+            return len;
+        },
+        &jpeg_bytes);
+    int64_t dt = esp_timer_get_time() - t0;
+
+    if (!ok) {
+        ESP_LOGE(TAG, "CaptureToJpeg: image_to_jpeg_cb failed");
+        jpeg_bytes.clear();
+        return false;
+    }
+    ESP_LOGI(TAG, "CaptureToJpeg: %u bytes in %lld ms",
+             static_cast<unsigned>(jpeg_bytes.size()), dt / 1000);
+    return true;
+}
+
 std::string Esp32Camera::Explain(const std::string &question) {
     if (explain_url_.empty()) {
         throw std::runtime_error("Image explain URL or token is not set");

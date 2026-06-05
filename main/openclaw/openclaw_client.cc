@@ -29,7 +29,9 @@ int OpenclawClient::HttpEventThunk(HttpEvent* evt_opaque) {
     return ESP_OK;
 }
 
-bool OpenclawClient::Stream(const std::string& input, const Callbacks& cb) {
+bool OpenclawClient::Stream(const std::string& input,
+                            const Callbacks& cb,
+                            const std::string& image_data_url) {
     cb_ = cb;
     buffer_.clear();
     current_event_.clear();
@@ -47,12 +49,23 @@ bool OpenclawClient::Stream(const std::string& input, const Callbacks& cb) {
     cJSON_AddStringToObject(root, "user", cfg_.user.c_str());
     cJSON_AddBoolToObject(root, "stream", true);
     cJSON_AddNumberToObject(root, "max_output_tokens", cfg_.max_output_tokens);
+    if (!image_data_url.empty()) {
+        cJSON_AddStringToObject(root, "image", image_data_url.c_str());
+    }
     char* body_cstr = cJSON_PrintUnformatted(root);
     std::string body = body_cstr ? body_cstr : "{}";
     cJSON_free(body_cstr);
     cJSON_Delete(root);
 
-    ESP_LOGI(TAG, "POST %s body=%s", url.c_str(), body.c_str());
+    // Don't dump the full body (~70 KB if image attached) — log a short
+    // summary instead so the serial log stays readable.
+    if (image_data_url.empty()) {
+        ESP_LOGI(TAG, "POST %s body=%s", url.c_str(), body.c_str());
+    } else {
+        ESP_LOGI(TAG, "POST %s input=%s image=%u bytes (data url)",
+                 url.c_str(), input.c_str(),
+                 static_cast<unsigned>(image_data_url.size()));
+    }
 
     esp_http_client_config_t http_cfg = {};
     http_cfg.url = url.c_str();

@@ -62,7 +62,16 @@ public:
 
     // Synchronous: opens HTTP, streams SSE, fires callbacks, then returns.
     // Returns true if stream ended with [DONE] cleanly.
-    bool Stream(const std::string& input, const Callbacks& cb);
+    //
+    // image_data_url (optional): if non-empty, attached to the request as
+    //   { ..., "image": "<data_url>" }
+    // The expected value is an OpenAI-style data URL, e.g.
+    //   "data:image/jpeg;base64,/9j/4AAQ..."
+    // OpenClaw routes a request with an image field to a vision-capable
+    // model (Claude/GPT-4V/Gemini). The SSE reply format is unchanged.
+    bool Stream(const std::string& input,
+                const Callbacks& cb,
+                const std::string& image_data_url = "");
 
     // ----- TTS streaming: /v1/audio/speech ---------------------------------
     struct SpeakCallbacks {

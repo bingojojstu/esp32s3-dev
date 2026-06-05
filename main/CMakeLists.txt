@@ -1035,6 +1035,7 @@ idf_component_register(SRCS ${SOURCES}
                         fatfs
                         esp_http_client
                         lwip
+                        mbedtls
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 

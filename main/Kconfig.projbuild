@@ -1073,6 +1073,32 @@ config OPENCLAW_TTS_SPEED
         Range supported by the server is 0.5 - 2.0. Leave empty to use
         the server default (1.0).
 
+config USE_OPENCLAW_VISION
+    bool "Send a camera snapshot when speech contains a vision keyword"
+    default y
+    depends on USE_OPENCLAW_BACKEND
+    help
+        When enabled, every BOOT-long-press also captures a single JPEG
+        snapshot from the on-board camera in parallel with audio recording.
+        After STT, if the recognised text contains any of the comma-
+        separated keywords in OPENCLAW_VISION_KEYWORDS, the snapshot is
+        base64-encoded and attached to the /v1/responses POST as an
+        "image" field. OpenClaw routes such requests to a vision-capable
+        model. Otherwise the snapshot is silently dropped and we follow
+        the regular text-only Phase 2 path.
+
+        Disable this if the board has no camera or you want to save a
+        bit of CPU/RAM on every recording.
+
+config OPENCLAW_VISION_KEYWORDS
+    string "Comma-separated keywords that trigger the vision path"
+    default "看,看看,瞧,瞅,这是,这个,那是,那个,帮我看,是什么,几个,什么颜色,look,see,what is,what's this,show me,how many"
+    depends on USE_OPENCLAW_VISION
+    help
+        Each comma-separated token is matched as a UTF-8 substring inside
+        the STT transcript. If any token appears, the captured image is
+        sent along. Whitespace around tokens is trimmed.
+
 config OPENCLAW_OUTPUT_VOLUME
     int "Speaker output volume (0 = mute, 100 = max)"
     default 100
