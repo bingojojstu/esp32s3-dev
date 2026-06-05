@@ -81,8 +81,13 @@ bool OpenclawClient::Stream(const std::string& input,
     http_cfg.event_handler = reinterpret_cast<http_event_handle_cb>(&HttpEventThunk);
     http_cfg.user_data = this;
     http_cfg.disable_auto_redirect = true;
-    http_cfg.buffer_size = 1024;
-    http_cfg.buffer_size_tx = 1024;
+    // RX: chat replies stream incrementally so a modest buffer suffices.
+    // TX: vision requests carry a base64 JPEG (~70-120 KB of payload).
+    // Without a big TX buffer the body gets flushed in 1 KB chunks, each
+    // paying a WiFi round-trip — pushing a typical vision request from
+    // ~4 s to >30 s. 32 KB gets a typical body out in one shot.
+    http_cfg.buffer_size = 4096;
+    http_cfg.buffer_size_tx = 32768;
 
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
     if (!client) {
@@ -263,7 +268,10 @@ bool OpenclawClient::Speak(const std::string& input, const SpeakCallbacks& cb) {
     http_cfg.method = HTTP_METHOD_POST;
     http_cfg.timeout_ms = 60000;
     http_cfg.disable_auto_redirect = true;
-    http_cfg.buffer_size = 1024;
+    // RX: TTS streams Opus frames back; a larger receive buffer cuts the
+    // number of read syscalls per second. TX: body is just a small JSON
+    // object so the default suffices.
+    http_cfg.buffer_size = 4096;
     http_cfg.buffer_size_tx = 1024;
 
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
@@ -468,8 +476,11 @@ bool OpenclawClient::Transcribe(const std::vector<int16_t>& pcm,
     http_cfg.method = HTTP_METHOD_POST;
     http_cfg.timeout_ms = 60000;
     http_cfg.disable_auto_redirect = true;
-    http_cfg.buffer_size = 1024;
-    http_cfg.buffer_size_tx = 1024;
+    // RX: STT response is tiny ({"text":"..."}). TX: WAV upload averages
+    // 30-70 KB for typical utterances; 8 KB gets the body out in ~5-10
+    // sends instead of the 30-70 sends needed at 1 KB.
+    http_cfg.buffer_size = 4096;
+    http_cfg.buffer_size_tx = 8192;
 
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
     if (!client) {
