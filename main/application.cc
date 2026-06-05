@@ -1289,8 +1289,6 @@ static void OpenclawVoiceWorker(void* arg) {
              static_cast<unsigned>(pcm.size()),
              pcm.size() / float(kVoiceSampleRate));
 
-    if (display) display->DismissAlert();
-
     if (static_cast<int>(pcm.size()) < kVoiceMinSamples) {
         ESP_LOGW("Application", "Voice clip too short, ignoring");
         if (display) display->ShowNotification("Too short", 2000);
@@ -1308,8 +1306,6 @@ static void OpenclawVoiceWorker(void* arg) {
     // Free PCM ASAP — Stream() will need RAM for SSE buffering.
     pcm.clear();
     pcm.shrink_to_fit();
-
-    if (display) display->DismissAlert();
 
     if (!stt_ok || text.empty()) {
         const char* msg = stt_ok ? "Empty transcription" : "STT failed";
