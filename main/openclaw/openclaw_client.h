@@ -60,31 +60,21 @@ public:
     // Returns true if stream ended with [DONE] cleanly.
     bool Stream(const std::string& input, const Callbacks& cb);
 
-    // Synchronous: POST raw PCM (16 kHz, 16-bit, mono) wrapped in a WAV
-    // container as multipart/form-data to /v1/audio/transcriptions. The
-    // recognised text is written into *text on success.
+    // Synchronous: POST raw 16 kHz / 16-bit / mono PCM (wrapped in a 44-byte
+    // RIFF/WAVE header) as the entire request body to /v1/audio/transcriptions.
+    // Per OpenClaw's contract this is NOT multipart — just plain WAV bytes
+    // with Content-Type: application/octet-stream, no Authorization, no
+    // model/language fields (the server auto-detects). The recognised text
+    // is written into *text on success.
     //
-    // OpenAI-compatible request:
     //   POST /v1/audio/transcriptions
-    //   Authorization: Bearer <token>
-    //   Content-Type: multipart/form-data; boundary=...
-    //
-    //   --boundary
-    //   Content-Disposition: form-data; name="model"
-    //
-    //   whisper-1
-    //   --boundary
-    //   Content-Disposition: form-data; name="language"
-    //
-    //   zh
-    //   --boundary
-    //   Content-Disposition: form-data; name="file"; filename="audio.wav"
-    //   Content-Type: audio/wav
+    //   Content-Type: application/octet-stream
     //
     //   <WAV bytes>
-    //   --boundary--
     //
-    // Reply: { "text": "..." }
+    //   -> 200 { "text": "..." }
+    //   -> 400 { "error": { "message": "Empty body" } }
+    //   -> 500 { "error": { "message": "transcription failed" } }
     bool Transcribe(const std::vector<int16_t>& pcm, std::string* text);
 
 private:

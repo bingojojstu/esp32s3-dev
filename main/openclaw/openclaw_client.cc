@@ -254,52 +254,15 @@ bool OpenclawClient::Transcribe(const std::vector<int16_t>& pcm,
         return false;
     }
 
-    // Use a plain alphanumeric boundary — no leading dashes — so paranoid
-    // multipart parsers (some FastAPI/python-multipart edge cases) can't
-    // mis-match against the body's "--boundary" delimiter.
-    const std::string boundary = "OpenclawSTTBoundary7MA4YWxkTrZu0gW";
     const uint32_t pcm_bytes = static_cast<uint32_t>(pcm.size() * sizeof(int16_t));
 
-    // ---- File part FIRST (some parsers care about order) -----------------
-    // Headers up to the start of the WAV bytes:
-    std::string file_part_headers =
-        "--" + boundary + "\r\n"
-        "Content-Disposition: form-data; name=\"file\"; "
-                "filename=\"audio.wav\"\r\n"
-        "Content-Type: audio/wav\r\n"
-        "\r\n";
-
-    // 44-byte RIFF/WAVE header — kept separate from text headers so we can
-    // log the ASCII portion safely.
+    // Per OpenClaw contract: the entire body is just a WAV blob — no
+    // multipart, no extra form fields, no Authorization. The 44-byte
+    // RIFF/WAVE header is followed by raw PCM samples.
     std::string wav_header;
     AppendWavHeader(&wav_header, pcm_bytes);
 
-    // ---- Form fields (model, language) AFTER the file ------------------
-    auto build_field = [&](const char* name, const char* value) {
-        std::string s;
-        s.reserve(128);
-        s += "\r\n--";
-        s += boundary;
-        s += "\r\n";
-        s += "Content-Disposition: form-data; name=\"";
-        s += name;
-        s += "\"\r\n\r\n";
-        s += value;
-        return s;
-    };
-    std::string model_field    = build_field("model",    "whisper-1");
-    std::string language_field = build_field("language", "zh");
-
-    // ---- Closing boundary ----------------------------------------------
-    std::string trailer = "\r\n--" + boundary + "--\r\n";
-
-    const size_t content_length =
-        file_part_headers.size() + wav_header.size() + pcm_bytes +
-        model_field.size() + language_field.size() + trailer.size();
-
-    ESP_LOGI(TAG, "multipart prologue:\n%s[WAV header 44 bytes]\n[PCM %u bytes]%s%s%s",
-             file_part_headers.c_str(), static_cast<unsigned>(pcm_bytes),
-             model_field.c_str(), language_field.c_str(), trailer.c_str());
+    const size_t content_length = wav_header.size() + pcm_bytes;
 
     const std::string url = "http://" + cfg_.host + ":"
                           + std::to_string(cfg_.port)
@@ -323,10 +286,8 @@ bool OpenclawClient::Transcribe(const std::vector<int16_t>& pcm,
         return false;
     }
 
-    const std::string content_type = "multipart/form-data; boundary=" + boundary;
-    esp_http_client_set_header(client, "Content-Type", content_type.c_str());
-    const std::string auth = "Bearer " + cfg_.token;
-    esp_http_client_set_header(client, "Authorization", auth.c_str());
+    esp_http_client_set_header(client, "Content-Type",
+                               "application/octet-stream");
 
     bool ok = false;
     do {
@@ -347,16 +308,11 @@ bool OpenclawClient::Transcribe(const std::vector<int16_t>& pcm,
             return true;
         };
 
-        // Order:  --boundary + file headers + WAV header + PCM
-        //         + \r\n--boundary + model + \r\n--boundary + language
-        //         + \r\n--boundary--\r\n
-        if (!write_all("file headers", file_part_headers.data(),
-                       file_part_headers.size())) break;
-        if (!write_all("wav header",   wav_header.data(),
+        // WAV header (44 bytes) then PCM streamed in small chunks so we
+        // don't allocate a giant contiguous send buffer.
+        if (!write_all("wav header", wav_header.data(),
                        wav_header.size())) break;
 
-        // Stream the PCM in small chunks so we don't have to allocate a
-        // giant contiguous send buffer.
         const char* pcm_ptr = reinterpret_cast<const char*>(pcm.data());
         size_t remaining = pcm_bytes;
         const size_t kChunk = 2048;
@@ -373,13 +329,6 @@ bool OpenclawClient::Transcribe(const std::vector<int16_t>& pcm,
             remaining -= n;
         }
         if (!pcm_ok) break;
-
-        if (!write_all("model field",    model_field.data(),
-                       model_field.size())) break;
-        if (!write_all("language field", language_field.data(),
-                       language_field.size())) break;
-        if (!write_all("trailer",        trailer.data(),
-                       trailer.size())) break;
 
         int64_t total = esp_http_client_fetch_headers(client);
         int status   = esp_http_client_get_status_code(client);
