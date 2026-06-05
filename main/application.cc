@@ -1531,30 +1531,41 @@ static void OpenclawVoiceWorker(void* arg) {
     }
 
     // -------- Phase 1: record + inline energy VAD -----------------------
-    // We exit when ANY of the following holds:
+    // Two-phase state machine:
+    //   1. WAITING — recording started, user hasn't begun talking yet.
+    //      Allow up to kVadInitialWaitMs of silence before giving up.
+    //   2. SPEAKING — speech detected at least once. End recording
+    //      when sustained silence (>= kVadEndSilenceMs) accumulates,
+    //      gated by at least kVadMinSpeechMs of speech so a brief
+    //      noise hit + immediate silence doesn't end us.
+    //
+    // We also exit when:
     //   * g_voice_recording is cleared (BOOT release / explicit stop)
-    //   * VAD: at least kVadMinSpeechMs of speech AND kVadSilenceMs of
-    //     trailing silence below the energy threshold
     //   * Recording length hits the absolute cap (kVoiceMaxSeconds)
     std::vector<int16_t> pcm;
     pcm.reserve(kVoiceMaxSamples);
 
     constexpr int kChunkMs = (kVoiceChunkSamples * 1000) / kVoiceSampleRate;
 #ifdef CONFIG_USE_OPENCLAW_WAKE_WORD
-    const int kVadThreshold     = CONFIG_OPENCLAW_VAD_RMS_THRESHOLD;
-    const int kVadMinSpeechMs   = CONFIG_OPENCLAW_VAD_MIN_SPEECH_MS;
-    const int kVadSilenceStopMs = CONFIG_OPENCLAW_VAD_SILENCE_MS;
+    const int kVadThreshold       = CONFIG_OPENCLAW_VAD_RMS_THRESHOLD;
+    const int kVadMinSpeechMs     = CONFIG_OPENCLAW_VAD_MIN_SPEECH_MS;
+    const int kVadEndSilenceMs    = CONFIG_OPENCLAW_VAD_SILENCE_MS;
+    const int kVadInitialWaitMs   = CONFIG_OPENCLAW_VAD_INITIAL_WAIT_MS;
 #else
     // VAD parameters are #ifdef'd onto USE_OPENCLAW_WAKE_WORD because
     // their Kconfig entries are too — when wake word is off the worker
     // is BOOT-only and just runs to user release.
-    const int kVadThreshold     = 0;
-    const int kVadMinSpeechMs   = 0;
-    const int kVadSilenceStopMs = 0;
+    const int kVadThreshold       = 0;
+    const int kVadMinSpeechMs     = 0;
+    const int kVadEndSilenceMs    = 0;
+    const int kVadInitialWaitMs   = 0;
 #endif
     const bool vad_enabled = (kVadThreshold > 0);
 
-    int silent_ms = 0;
+    enum VadPhase { WAITING_FOR_SPEECH, SPEAKING };
+    VadPhase phase = WAITING_FOR_SPEECH;
+    int initial_silent_ms = 0;
+    int end_silent_ms = 0;
     int speech_ms = 0;
 
     while (g_voice_recording.load() &&
@@ -1566,20 +1577,38 @@ static void OpenclawVoiceWorker(void* arg) {
         }
 
         if (vad_enabled) {
-            int avg_abs = AverageAbsSample(chunk);
-            if (avg_abs > kVadThreshold) {
+            const int avg_abs = AverageAbsSample(chunk);
+            const bool is_speech = (avg_abs > kVadThreshold);
+
+            if (is_speech) {
                 speech_ms += kChunkMs;
-                silent_ms = 0;
+                end_silent_ms = 0;
+                if (phase == WAITING_FOR_SPEECH) {
+                    phase = SPEAKING;
+                    ESP_LOGI("Application", "VAD: speech started");
+                }
             } else {
-                silent_ms += kChunkMs;
-            }
-            if (speech_ms >= kVadMinSpeechMs &&
-                silent_ms >= kVadSilenceStopMs) {
-                ESP_LOGI("Application",
-                         "VAD: end of speech (%d ms speech, %d ms silence)",
-                         speech_ms, silent_ms);
-                pcm.insert(pcm.end(), chunk.begin(), chunk.end());
-                break;
+                if (phase == WAITING_FOR_SPEECH) {
+                    initial_silent_ms += kChunkMs;
+                    if (initial_silent_ms >= kVadInitialWaitMs) {
+                        ESP_LOGI("Application",
+                                 "VAD: no speech after %d ms, giving up",
+                                 initial_silent_ms);
+                        pcm.insert(pcm.end(), chunk.begin(), chunk.end());
+                        break;
+                    }
+                } else {
+                    end_silent_ms += kChunkMs;
+                    if (speech_ms >= kVadMinSpeechMs &&
+                        end_silent_ms >= kVadEndSilenceMs) {
+                        ESP_LOGI("Application",
+                                 "VAD: end of speech "
+                                 "(%d ms total speech, %d ms trailing silence)",
+                                 speech_ms, end_silent_ms);
+                        pcm.insert(pcm.end(), chunk.begin(), chunk.end());
+                        break;
+                    }
+                }
             }
         }
 

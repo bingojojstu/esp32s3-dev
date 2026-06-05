@@ -1141,16 +1141,31 @@ config USE_OPENCLAW_WAKE_WORD
         BOOT long-press still works in parallel as a backup trigger
         for quiet environments.
 
+config OPENCLAW_VAD_INITIAL_WAIT_MS
+    int "Silence (ms) allowed BEFORE the user starts talking"
+    default 5000
+    range 500 15000
+    depends on USE_OPENCLAW_WAKE_WORD
+    help
+        After wake word fires (or BOOT long-press), how long to wait
+        in silence for the user to start speaking before giving up.
+        Generous default (5 s) so you have time to formulate a
+        sentence after triggering. Has no effect during/after speech.
+
 config OPENCLAW_VAD_SILENCE_MS
-    int "Silence duration (ms) to end recording"
-    default 1000
+    int "Silence (ms) after speech that ends recording"
+    default 1500
     range 200 5000
     depends on USE_OPENCLAW_WAKE_WORD
     help
-        Once the energy VAD sees this many consecutive milliseconds of
-        sub-threshold audio, recording stops. Too short cuts the user
-        off mid-thought; too long adds latency between "user finishes"
-        and "request goes out".
+        Once you've started talking, this is how much sustained
+        sub-threshold audio means "user finished". 1.5 s tolerates
+        thinking pauses ("um...", "那个...") within a sentence while
+        still being snappy at end. NOTE: at the audio level a thinking
+        pause and an end-of-utterance pause look identical — without
+        live ASR there's no way to truly tell them apart, so this
+        value is a balance. Raise toward 2-3 s if you talk slowly;
+        lower toward 800 ms for snappier response.
 
 config OPENCLAW_VAD_MIN_SPEECH_MS
     int "Minimum speech (ms) required before VAD-end can fire"
