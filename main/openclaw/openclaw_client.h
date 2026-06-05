@@ -58,20 +58,30 @@ public:
         std::function<void(const std::string& message)> on_error;
     };
 
+    struct StreamOptions {
+        // If non-empty, attached to the request body as
+        //   { ..., "image": "<data_url>" }
+        // AND switches the URL from /v1/responses to /v1/vision, because
+        // OpenClaw's standard agent pipeline drops images today — the
+        // voice-esp32 plugin provides /v1/vision as a bypass that calls
+        // the vision model directly and returns SSE in the same format.
+        // The data URL is OpenAI-style:
+        //   "data:image/jpeg;base64,/9j/4AAQ..."
+        std::string image_data_url;
+        // If non-empty, overrides cfg_.model in the x-openclaw-model
+        // header for THIS request only. Used to select a vision-capable
+        // model when image_data_url is set, since the chat/voice default
+        // model usually doesn't do vision well.
+        std::string model_override;
+    };
+
     explicit OpenclawClient(Config cfg);
 
     // Synchronous: opens HTTP, streams SSE, fires callbacks, then returns.
     // Returns true if stream ended with [DONE] cleanly.
-    //
-    // image_data_url (optional): if non-empty, attached to the request as
-    //   { ..., "image": "<data_url>" }
-    // The expected value is an OpenAI-style data URL, e.g.
-    //   "data:image/jpeg;base64,/9j/4AAQ..."
-    // OpenClaw routes a request with an image field to a vision-capable
-    // model (Claude/GPT-4V/Gemini). The SSE reply format is unchanged.
     bool Stream(const std::string& input,
                 const Callbacks& cb,
-                const std::string& image_data_url = "");
+                const StreamOptions& opts = {});
 
     // ----- TTS streaming: /v1/audio/speech ---------------------------------
     struct SpeakCallbacks {

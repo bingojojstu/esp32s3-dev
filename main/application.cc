@@ -1372,15 +1372,16 @@ static OpenclawClient::Config MakeOpenclawConfig() {
     return cfg;
 }
 
-// Open SSE stream to /v1/responses, accumulate deltas, render final reply,
-// and return the accumulated text so the caller can pipe it on to TTS.
+// Open SSE stream, accumulate deltas, render final reply, and return the
+// accumulated text so the caller can pipe it on to TTS.
 // Returns an empty string on error / [DONE] with no content.
-// image_data_url: if non-empty, attached to the request — caller checks
-// the STT text for a vision keyword and decides.
-static std::string StreamOpenclawReplyAndDisplay(OpenclawClient& client,
-                                                 const std::string& user_text,
-                                                 Display* display,
-                                                 const std::string& image_data_url = "") {
+// opts.image_data_url + opts.model_override are forwarded; when the image
+// is set the request goes to /v1/vision (see OpenclawClient::Stream).
+static std::string StreamOpenclawReplyAndDisplay(
+        OpenclawClient& client,
+        const std::string& user_text,
+        Display* display,
+        const OpenclawClient::StreamOptions& opts = {}) {
     std::string accumulated;
     uint32_t delta_count = 0;
 
@@ -1407,7 +1408,7 @@ static std::string StreamOpenclawReplyAndDisplay(OpenclawClient& client,
         if (display) display->ShowNotification(msg.c_str(), 5000);
     };
 
-    client.Stream(user_text, cb, image_data_url);
+    client.Stream(user_text, cb, opts);
     return accumulated;
 }
 
@@ -1540,16 +1541,19 @@ static void OpenclawVoiceWorker(void* arg) {
     if (display) display->SetChatMessage("user", text.c_str());
 
     // -------- Phase 3: optional vision (camera attachment) -------------
-    std::string image_url;
+    OpenclawClient::StreamOptions stream_opts;
 #ifdef CONFIG_USE_OPENCLAW_VISION
-    image_url = MaybeExtractVisionDataUrl(text, /*wait_ms=*/2000);
-    if (!image_url.empty() && display) {
-        display->ShowNotification("\xF0\x9F\x91\x80 sending image...", 2000);
+    stream_opts.image_data_url = MaybeExtractVisionDataUrl(text, /*wait_ms=*/2000);
+    if (!stream_opts.image_data_url.empty()) {
+        stream_opts.model_override = CONFIG_OPENCLAW_VISION_MODEL;
+        if (display) {
+            display->ShowNotification("\xF0\x9F\x91\x80 sending image...", 2000);
+        }
     }
 #endif
 
     // -------- Phase 4: stream LLM reply --------------------------------
-    std::string reply = StreamOpenclawReplyAndDisplay(client, text, display, image_url);
+    std::string reply = StreamOpenclawReplyAndDisplay(client, text, display, stream_opts);
 
 #ifdef CONFIG_USE_OPENCLAW_TTS
     // -------- Phase 5: TTS playback ------------------------------------

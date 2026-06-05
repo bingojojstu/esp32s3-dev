@@ -1099,6 +1099,17 @@ config OPENCLAW_VISION_KEYWORDS
         the STT transcript. If any token appears, the captured image is
         sent along. Whitespace around tokens is trimmed.
 
+config OPENCLAW_VISION_MODEL
+    string "Vision model override (empty = OpenClaw default)"
+    default ""
+    depends on USE_OPENCLAW_VISION
+    help
+        Sent as the x-openclaw-model header ONLY for vision requests
+        (those that go to /v1/vision). Leave empty to let the
+        voice-esp32 plugin pick. Typical values match whatever your
+        OpenClaw deployment recognises: kimi-latest, claude-sonnet-4,
+        gpt-4o, etc.
+
 config OPENCLAW_OUTPUT_VOLUME
     int "Speaker output volume (0 = mute, 100 = max)"
     default 100

@@ -31,7 +31,7 @@ int OpenclawClient::HttpEventThunk(HttpEvent* evt_opaque) {
 
 bool OpenclawClient::Stream(const std::string& input,
                             const Callbacks& cb,
-                            const std::string& image_data_url) {
+                            const StreamOptions& opts) {
     cb_ = cb;
     buffer_.clear();
     current_event_.clear();
@@ -39,8 +39,13 @@ bool OpenclawClient::Stream(const std::string& input,
     done_ = false;
     error_.clear();
 
-    // Build URL: http://host:port/v1/responses
-    std::string url = "http://" + cfg_.host + ":" + std::to_string(cfg_.port) + "/v1/responses";
+    // Route by payload type:
+    //   image present  -> /v1/vision (voice-esp32 plugin bypass)
+    //   image absent   -> /v1/responses (regular chat path)
+    const bool has_image = !opts.image_data_url.empty();
+    const char* path = has_image ? "/v1/vision" : "/v1/responses";
+    std::string url = "http://" + cfg_.host + ":"
+                    + std::to_string(cfg_.port) + path;
 
     // Build request body via cJSON (handles escaping for us).
     cJSON* root = cJSON_CreateObject();
@@ -49,8 +54,8 @@ bool OpenclawClient::Stream(const std::string& input,
     cJSON_AddStringToObject(root, "user", cfg_.user.c_str());
     cJSON_AddBoolToObject(root, "stream", true);
     cJSON_AddNumberToObject(root, "max_output_tokens", cfg_.max_output_tokens);
-    if (!image_data_url.empty()) {
-        cJSON_AddStringToObject(root, "image", image_data_url.c_str());
+    if (has_image) {
+        cJSON_AddStringToObject(root, "image", opts.image_data_url.c_str());
     }
     char* body_cstr = cJSON_PrintUnformatted(root);
     std::string body = body_cstr ? body_cstr : "{}";
@@ -59,12 +64,14 @@ bool OpenclawClient::Stream(const std::string& input,
 
     // Don't dump the full body (~70 KB if image attached) — log a short
     // summary instead so the serial log stays readable.
-    if (image_data_url.empty()) {
+    if (!has_image) {
         ESP_LOGI(TAG, "POST %s body=%s", url.c_str(), body.c_str());
     } else {
-        ESP_LOGI(TAG, "POST %s input=%s image=%u bytes (data url)",
+        ESP_LOGI(TAG, "POST %s input=%s image=%u bytes (data url) model=%s",
                  url.c_str(), input.c_str(),
-                 static_cast<unsigned>(image_data_url.size()));
+                 static_cast<unsigned>(opts.image_data_url.size()),
+                 opts.model_override.empty() ? "(default)"
+                                             : opts.model_override.c_str());
     }
 
     esp_http_client_config_t http_cfg = {};
@@ -89,8 +96,13 @@ bool OpenclawClient::Stream(const std::string& input,
     if (!cfg_.agent_id.empty()) {
         esp_http_client_set_header(client, "x-openclaw-agent-id", cfg_.agent_id.c_str());
     }
-    if (!cfg_.model.empty()) {
-        esp_http_client_set_header(client, "x-openclaw-model", cfg_.model.c_str());
+    // Model header: per-call override (vision path) wins over the default.
+    const std::string& effective_model = !opts.model_override.empty()
+                                       ? opts.model_override
+                                       : cfg_.model;
+    if (!effective_model.empty()) {
+        esp_http_client_set_header(client, "x-openclaw-model",
+                                   effective_model.c_str());
     }
     esp_http_client_set_header(client, "Accept", "text/event-stream");
 
