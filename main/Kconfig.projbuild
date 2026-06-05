@@ -1053,4 +1053,24 @@ config USE_OPENCLAW_TTS
         this if your OpenClaw instance does not yet expose the speech
         endpoint, or if you want a text-only "silent" mode for debugging.
 
+config OPENCLAW_TTS_VOICE
+    string "TTS voice (empty = OpenClaw default = female-shaonv)"
+    default ""
+    depends on USE_OPENCLAW_TTS
+    help
+        Passed as the "voice" field on each /v1/audio/speech request.
+        Known values at the time of writing: female-shaonv, female-wenrou,
+        female-tianmei, female-chengshu, male-qingnian, male-chengshu,
+        en-female-narrator. Leave empty to let the server choose
+        (currently female-shaonv).
+
+config OPENCLAW_TTS_SPEED
+    string "TTS speed (e.g. 0.8, 1.0, 1.5; empty = server default)"
+    default ""
+    depends on USE_OPENCLAW_TTS
+    help
+        Passed as the "speed" field on each /v1/audio/speech request.
+        Range supported by the server is 0.5 - 2.0. Leave empty to use
+        the server default (1.0).
+
 endmenu

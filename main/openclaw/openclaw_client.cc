@@ -1,6 +1,7 @@
 #include "openclaw_client.h"
 
 #include <cJSON.h>
+#include <cstdlib>
 #include <cstring>
 #include <esp_http_client.h>
 #include <esp_log.h>
@@ -202,6 +203,21 @@ bool OpenclawClient::Speak(const std::string& input, const SpeakCallbacks& cb) {
     // Build JSON request body via cJSON so escaping is correct.
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "input", input.c_str());
+#ifdef CONFIG_OPENCLAW_TTS_VOICE
+    if (strlen(CONFIG_OPENCLAW_TTS_VOICE) > 0) {
+        cJSON_AddStringToObject(root, "voice", CONFIG_OPENCLAW_TTS_VOICE);
+    }
+#endif
+#ifdef CONFIG_OPENCLAW_TTS_SPEED
+    if (strlen(CONFIG_OPENCLAW_TTS_SPEED) > 0) {
+        // Server expects a number; let cJSON serialize it. atof handles
+        // empty/invalid as 0 (skipped above).
+        double speed = atof(CONFIG_OPENCLAW_TTS_SPEED);
+        if (speed >= 0.5 && speed <= 2.0) {
+            cJSON_AddNumberToObject(root, "speed", speed);
+        }
+    }
+#endif
     char* body_cstr = cJSON_PrintUnformatted(root);
     std::string body = body_cstr ? body_cstr : "{}";
     cJSON_free(body_cstr);
