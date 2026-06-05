@@ -193,6 +193,150 @@ void OpenclawClient::DispatchEvent() {
     current_data_.clear();
 }
 
+bool OpenclawClient::Speak(const std::string& input, const SpeakCallbacks& cb) {
+    if (input.empty()) {
+        if (cb.on_error) cb.on_error("empty input");
+        return false;
+    }
+
+    // Build JSON request body via cJSON so escaping is correct.
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "input", input.c_str());
+    char* body_cstr = cJSON_PrintUnformatted(root);
+    std::string body = body_cstr ? body_cstr : "{}";
+    cJSON_free(body_cstr);
+    cJSON_Delete(root);
+
+    const std::string url = "http://" + cfg_.host + ":"
+                          + std::to_string(cfg_.port) + "/v1/audio/speech";
+    ESP_LOGI(TAG, "POST %s body=%s", url.c_str(), body.c_str());
+
+    esp_http_client_config_t http_cfg = {};
+    http_cfg.url = url.c_str();
+    http_cfg.method = HTTP_METHOD_POST;
+    http_cfg.timeout_ms = 60000;
+    http_cfg.disable_auto_redirect = true;
+    http_cfg.buffer_size = 1024;
+    http_cfg.buffer_size_tx = 1024;
+
+    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
+    if (!client) {
+        if (cb.on_error) cb.on_error("esp_http_client_init failed");
+        return false;
+    }
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "Accept", "application/octet-stream");
+
+    bool ok = false;
+    uint32_t frame_count = 0;
+
+    do {
+        esp_err_t err = esp_http_client_open(client, body.size());
+        if (err != ESP_OK) {
+            std::string msg = std::string("open failed: ") + esp_err_to_name(err);
+            ESP_LOGE(TAG, "%s", msg.c_str());
+            if (cb.on_error) cb.on_error(msg);
+            break;
+        }
+
+        int w = esp_http_client_write(client, body.data(),
+                                      static_cast<int>(body.size()));
+        if (w != static_cast<int>(body.size())) {
+            ESP_LOGE(TAG, "write body failed: %d/%u", w,
+                     static_cast<unsigned>(body.size()));
+            if (cb.on_error) cb.on_error("write body failed");
+            break;
+        }
+
+        int64_t total = esp_http_client_fetch_headers(client);
+        int status   = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "TTS response status=%d content-length=%lld",
+                 status, total);
+
+        if (status < 200 || status >= 300) {
+            char buf[256];
+            int rn = esp_http_client_read(client, buf, sizeof(buf));
+            std::string snippet(buf, rn > 0 ? rn : 0);
+            char msg[160];
+            snprintf(msg, sizeof(msg), "HTTP %d: %.100s",
+                     status, snippet.c_str());
+            ESP_LOGE(TAG, "%s", msg);
+            if (cb.on_error) cb.on_error(msg);
+            break;
+        }
+
+        // Helper: read exactly n bytes, looping over short reads.
+        // Returns: n  on full read, 0 on clean EOF before any bytes,
+        //          -1 on error / partial read.
+        auto read_exact = [&client](uint8_t* dst, int n) -> int {
+            int got = 0;
+            while (got < n) {
+                int r = esp_http_client_read(client, (char*)(dst + got), n - got);
+                if (r == 0) return got;       // EOF
+                if (r < 0)  return -1;
+                got += r;
+            }
+            return got;
+        };
+
+        // Stream loop: [uint16 BE len][len bytes opus] ...
+        bool stream_error = false;
+        while (true) {
+            uint8_t len_bytes[2];
+            int got = read_exact(len_bytes, 2);
+            if (got == 0) {
+                ok = true;        // clean EOF
+                break;
+            }
+            if (got != 2) {
+                ESP_LOGE(TAG, "short read on frame header (%d)", got);
+                if (cb.on_error) cb.on_error("short read on frame header");
+                stream_error = true;
+                break;
+            }
+
+            uint16_t frame_len = (static_cast<uint16_t>(len_bytes[0]) << 8)
+                               |  static_cast<uint16_t>(len_bytes[1]);
+            if (frame_len == 0 || frame_len > 1500) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "invalid frame length: %u",
+                         static_cast<unsigned>(frame_len));
+                ESP_LOGE(TAG, "%s", msg);
+                if (cb.on_error) cb.on_error(msg);
+                stream_error = true;
+                break;
+            }
+
+            auto packet = std::make_unique<AudioStreamPacket>();
+            packet->sample_rate    = 24000;
+            packet->frame_duration = 60;
+            packet->payload.resize(frame_len);
+            int body_got = read_exact(packet->payload.data(), frame_len);
+            if (body_got != frame_len) {
+                ESP_LOGE(TAG, "short read on frame body: %d/%u",
+                         body_got, static_cast<unsigned>(frame_len));
+                if (cb.on_error) cb.on_error("short read on frame body");
+                stream_error = true;
+                break;
+            }
+
+            ++frame_count;
+            if (cb.on_packet) cb.on_packet(std::move(packet));
+        }
+
+        ESP_LOGI(TAG, "TTS stream done: %u frames (~%.2fs of audio)",
+                 static_cast<unsigned>(frame_count),
+                 frame_count * 0.06f);
+        if (ok && cb.on_done) cb.on_done();
+        (void)stream_error;
+    } while (false);
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return ok;
+}
+
 bool OpenclawClient::ExtractDelta(const std::string& json, std::string* out) {
     cJSON* root = cJSON_Parse(json.c_str());
     if (!root) return false;

@@ -1212,11 +1212,12 @@ static OpenclawClient::Config MakeOpenclawConfig() {
     return cfg;
 }
 
-// Open SSE stream to /v1/responses, accumulate deltas, render final reply.
-// Returns when [DONE] fires or the stream errors out.
-static void StreamOpenclawReplyAndDisplay(OpenclawClient& client,
-                                          const std::string& user_text,
-                                          Display* display) {
+// Open SSE stream to /v1/responses, accumulate deltas, render final reply,
+// and return the accumulated text so the caller can pipe it on to TTS.
+// Returns an empty string on error / [DONE] with no content.
+static std::string StreamOpenclawReplyAndDisplay(OpenclawClient& client,
+                                                 const std::string& user_text,
+                                                 Display* display) {
     std::string accumulated;
     uint32_t delta_count = 0;
 
@@ -1244,7 +1245,42 @@ static void StreamOpenclawReplyAndDisplay(OpenclawClient& client,
     };
 
     client.Stream(user_text, cb);
+    return accumulated;
 }
+
+#ifdef CONFIG_USE_OPENCLAW_TTS
+// Post the LLM's final reply text to /v1/audio/speech and pipe the
+// returned Opus frames straight into AudioService's decode queue so the
+// existing Opus decoder + I2S task pair plays them through the speaker.
+// Blocking; runs from the same worker that did Stream().
+static void SpeakOpenclawReply(OpenclawClient& client,
+                               const std::string& text,
+                               Display* display) {
+    if (text.empty()) return;
+    auto& audio = Application::GetInstance().GetAudioService();
+
+    uint32_t frames = 0;
+    OpenclawClient::SpeakCallbacks cb;
+    cb.on_packet = [&audio, &frames](std::unique_ptr<AudioStreamPacket> p) {
+        // wait=true backpressures the HTTP read loop so PSRAM doesn't fill
+        // up if the decoder/I2S falls behind.
+        audio.PushPacketToDecodeQueue(std::move(p), /*wait=*/true);
+        ++frames;
+    };
+    cb.on_error = [display](const std::string& err) {
+        ESP_LOGE("Application", "TTS error: %s", err.c_str());
+        if (display) display->ShowNotification(err.c_str(), 3000);
+    };
+
+    bool ok = client.Speak(text, cb);
+    ESP_LOGI("Application", "TTS %s, %u frames queued",
+             ok ? "complete" : "failed", static_cast<unsigned>(frames));
+
+    // Drain the playback queue before the worker returns so a fast follow-up
+    // BOOT press doesn't talk over the in-flight reply.
+    audio.WaitForPlaybackQueueEmpty();
+}
+#endif
 
 // === Text path (BOOT short-press) ====================================
 struct OpenclawJob {
@@ -1258,7 +1294,11 @@ static void OpenclawTextWorker(void* arg) {
     if (display) display->SetChatMessage("user", job->prompt.c_str());
 
     OpenclawClient client(MakeOpenclawConfig());
-    StreamOpenclawReplyAndDisplay(client, job->prompt, display);
+    std::string reply = StreamOpenclawReplyAndDisplay(client, job->prompt, display);
+
+#ifdef CONFIG_USE_OPENCLAW_TTS
+    SpeakOpenclawReply(client, reply, display);
+#endif
 
     g_openclaw_in_flight = false;
     vTaskDelete(nullptr);
@@ -1337,7 +1377,12 @@ static void OpenclawVoiceWorker(void* arg) {
     if (display) display->SetChatMessage("user", text.c_str());
 
     // -------- Phase 3: stream LLM reply (same as text path) ------------
-    StreamOpenclawReplyAndDisplay(client, text, display);
+    std::string reply = StreamOpenclawReplyAndDisplay(client, text, display);
+
+#ifdef CONFIG_USE_OPENCLAW_TTS
+    // -------- Phase 4: TTS playback ------------------------------------
+    SpeakOpenclawReply(client, reply, display);
+#endif
 
     g_openclaw_in_flight = false;
     vTaskDelete(nullptr);

@@ -3,7 +3,11 @@
 
 #include <string>
 #include <functional>
+#include <memory>
 #include <atomic>
+#include <vector>
+
+#include "protocol.h"   // AudioStreamPacket
 
 /**
  * Minimal client for OpenClaw's OpenAI-Responses-compatible endpoint.
@@ -59,6 +63,29 @@ public:
     // Synchronous: opens HTTP, streams SSE, fires callbacks, then returns.
     // Returns true if stream ended with [DONE] cleanly.
     bool Stream(const std::string& input, const Callbacks& cb);
+
+    // ----- TTS streaming: /v1/audio/speech ---------------------------------
+    struct SpeakCallbacks {
+        // Called once per Opus frame as it arrives. Caller typically pushes
+        // straight into AudioService::PushPacketToDecodeQueue() so playback
+        // starts before the whole reply has been synthesized.
+        std::function<void(std::unique_ptr<AudioStreamPacket>)> on_packet;
+        // Called once when the stream ends cleanly (EOF after a full frame).
+        std::function<void()> on_done;
+        // Called on transport / HTTP / framing errors.
+        std::function<void(const std::string&)> on_error;
+    };
+
+    // Synchronous: POST {"input": text} to /v1/audio/speech and read back a
+    // stream of length-prefixed Opus frames:
+    //   [uint16 BE: N][N bytes opus frame] ...
+    //
+    // Each frame is 24 kHz / mono / 60 ms, matching the device-side Opus
+    // decoder + I2S output pipeline.
+    //
+    // Returns true if the stream ended cleanly. Blocking — call from a
+    // dedicated worker task, not from the main loop.
+    bool Speak(const std::string& input, const SpeakCallbacks& cb);
 
     // Synchronous: POST raw 16 kHz / 16-bit / mono PCM (wrapped in a 44-byte
     // RIFF/WAVE header) as the entire request body to /v1/audio/transcriptions.

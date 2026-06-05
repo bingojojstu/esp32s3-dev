@@ -1041,4 +1041,16 @@ config OPENCLAW_TEST_PROMPT
     default "你好，请简短地介绍一下你自己。"
     depends on USE_OPENCLAW_BACKEND
 
+config USE_OPENCLAW_TTS
+    bool "Play OpenClaw TTS reply over the speaker"
+    default y
+    depends on USE_OPENCLAW_BACKEND
+    help
+        When enabled, after the LLM finishes streaming text we POST the
+        final reply to /v1/audio/speech. The server streams back length-
+        prefixed Opus frames (24 kHz / mono / 60 ms) which we pipe into
+        AudioService's existing Opus decode + I2S output path. Disable
+        this if your OpenClaw instance does not yet expose the speech
+        endpoint, or if you want a text-only "silent" mode for debugging.
+
 endmenu
