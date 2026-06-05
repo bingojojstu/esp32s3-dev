@@ -1194,7 +1194,8 @@ static std::string CurrentOpenclawUserId() {
         return CONFIG_OPENCLAW_USER;
     }
     char buf[64];
-    snprintf(buf, sizeof(buf), "%s-s%u", CONFIG_OPENCLAW_USER, seq);
+    snprintf(buf, sizeof(buf), "%s-s%u",
+             CONFIG_OPENCLAW_USER, static_cast<unsigned>(seq));
     return buf;
 }
 
