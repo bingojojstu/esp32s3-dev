@@ -78,6 +78,17 @@ void Application::Initialize() {
     audio_service_.Initialize(codec);
     audio_service_.Start();
 
+#ifdef CONFIG_USE_OPENCLAW_BACKEND
+    // AudioCodec defaults to volume=70 which is ~0.49x amplitude — quiet
+    // through a MAX98357A driving a small speaker. Apply the configured
+    // default for the OpenClaw POC right after the codec is initialized.
+    if (codec) {
+        codec->SetOutputVolume(CONFIG_OPENCLAW_OUTPUT_VOLUME);
+        ESP_LOGI("Application", "Output volume set to %d",
+                 CONFIG_OPENCLAW_OUTPUT_VOLUME);
+    }
+#endif
+
     AudioServiceCallbacks callbacks;
     callbacks.on_send_queue_available = [this]() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);

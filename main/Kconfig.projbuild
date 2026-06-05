@@ -1073,4 +1073,18 @@ config OPENCLAW_TTS_SPEED
         Range supported by the server is 0.5 - 2.0. Leave empty to use
         the server default (1.0).
 
+config OPENCLAW_OUTPUT_VOLUME
+    int "Speaker output volume (0 = mute, 100 = max)"
+    default 100
+    range 0 100
+    depends on USE_OPENCLAW_BACKEND
+    help
+        AudioCodec::SetOutputVolume() is applied to every PCM sample
+        before I2S: out = in * (volume/100)^2. The default in
+        AudioCodec is 70, which works out to ~0.49x amplitude — fine
+        for the original Xiaozhi server (which sends loud audio) but
+        often too quiet for MiniMax TTS through a MAX98357A. Bumping
+        to 100 doubles the amplitude (+6 dB). Drop lower if the
+        speaker distorts or clips.
+
 endmenu
