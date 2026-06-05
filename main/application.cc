@@ -1195,11 +1195,31 @@ static std::atomic<bool> g_voice_recording{false};
 // Session counter. CONFIG_OPENCLAW_USER is the base; we suffix this counter
 // onto it so the same firmware can start fresh conversations on demand.
 // Bumped by Application::ResetOpenclawSession(); read by MakeOpenclawConfig.
-// Starts at 0 == bare CONFIG_OPENCLAW_USER (so first boot picks up wherever
-// the previous boot left off — matches Phase 1 behavior).
+//
+// Persisted to NVS (namespace "openclaw", key "session_seq") so that
+// rebooting the device does NOT reuse old session IDs that openclaw
+// already remembers. Without this, every "esp32-s3-s1" after a reboot
+// would silently re-enter the previous boot's first new session.
 static std::atomic<uint32_t> g_openclaw_session_seq{0};
+static std::atomic<bool>     g_seq_loaded{false};
+
+static const char kSeqNamespace[] = "openclaw";
+static const char kSeqKey[]       = "session_seq";
+
+static void EnsureSeqLoaded() {
+    if (g_seq_loaded.exchange(true)) return;  // already loaded
+    Settings settings(kSeqNamespace, /*readwrite=*/false);
+    int32_t persisted = settings.GetInt(kSeqKey, 0);
+    if (persisted > 0) {
+        g_openclaw_session_seq.store(static_cast<uint32_t>(persisted));
+        ESP_LOGI("Application",
+                 "Restored OpenClaw session seq from NVS: %u",
+                 static_cast<unsigned>(persisted));
+    }
+}
 
 static std::string CurrentOpenclawUserId() {
+    EnsureSeqLoaded();
     uint32_t seq = g_openclaw_session_seq.load();
     if (seq == 0) {
         return CONFIG_OPENCLAW_USER;
@@ -1441,9 +1461,16 @@ void Application::StopOpenclawVoice() {
 }
 
 void Application::ResetOpenclawSession() {
+    EnsureSeqLoaded();
     uint32_t next = g_openclaw_session_seq.fetch_add(1) + 1;
+
+    // Persist BEFORE displaying so even a power-loss-during-toast can't
+    // strand us on a reused ID next boot.
+    Settings settings(kSeqNamespace, /*readwrite=*/true);
+    settings.SetInt(kSeqKey, static_cast<int32_t>(next));
+
     std::string new_id = std::string(CONFIG_OPENCLAW_USER) + "-s" + std::to_string(next);
-    ESP_LOGI("Application", "OpenClaw session reset -> %s", new_id.c_str());
+    ESP_LOGI("Application", "OpenClaw session reset -> %s (persisted)", new_id.c_str());
     auto* display = Board::GetInstance().GetDisplay();
     if (display) {
         std::string msg = "New session: " + new_id;
