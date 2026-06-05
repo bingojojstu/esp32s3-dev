@@ -298,8 +298,8 @@ bool OpenclawClient::Speak(const std::string& input, const SpeakCallbacks& cb) {
 
         int64_t total = esp_http_client_fetch_headers(client);
         int status   = esp_http_client_get_status_code(client);
-        ESP_LOGI(TAG, "TTS response status=%d content-length=%lld",
-                 status, total);
+        ESP_LOGI(TAG, "TTS response status=%d content-length=%d",
+                 status, (int)total);
 
         if (status < 200 || status >= 300) {
             char buf[256];
@@ -523,8 +523,8 @@ bool OpenclawClient::Transcribe(const std::vector<int16_t>& pcm,
 
         int64_t total = esp_http_client_fetch_headers(client);
         int status   = esp_http_client_get_status_code(client);
-        ESP_LOGI(TAG, "STT response status=%d content-length=%lld",
-                 status, total);
+        ESP_LOGI(TAG, "STT response status=%d content-length=%d",
+                 status, (int)total);
 
         std::string body;
         body.reserve(256);
