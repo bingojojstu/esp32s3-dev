@@ -1491,6 +1491,74 @@ static constexpr int kVoiceMaxSeconds     = 15;
 static constexpr int kVoiceMaxSamples     = kVoiceSampleRate * kVoiceMaxSeconds;
 static constexpr int kVoiceMinSamples     = kVoiceSampleRate / 4;  // 0.25 s
 
+// ----- Wake-confirmation cache --------------------------------------------
+// We TTS the configured phrase once (lazily, on first wake) and stash the
+// Opus frames so subsequent wakes play the cue instantly.
+#ifdef CONFIG_OPENCLAW_WAKE_CONFIRM_TEXT
+static std::vector<std::vector<uint8_t>> g_wake_confirm_frames;
+static std::mutex                        g_wake_confirm_mutex;
+static std::atomic<bool>                 g_wake_confirm_fetched{false};
+static std::atomic<bool>                 g_wake_confirm_in_progress{false};
+
+static void EnsureWakeConfirmationLoaded() {
+    if (g_wake_confirm_fetched.load()) return;
+
+    bool expected = false;
+    if (!g_wake_confirm_in_progress.compare_exchange_strong(expected, true)) {
+        // Another caller is fetching; wait for it.
+        while (g_wake_confirm_in_progress.load() &&
+               !g_wake_confirm_fetched.load()) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        return;
+    }
+    // We hold the in_progress flag; do the fetch.
+    OpenclawClient client(MakeOpenclawConfig());
+    std::vector<std::vector<uint8_t>> frames;
+    OpenclawClient::SpeakCallbacks cb;
+    cb.on_packet = [&frames](std::unique_ptr<AudioStreamPacket> p) {
+        frames.push_back(std::move(p->payload));
+    };
+    cb.on_error = [](const std::string& msg) {
+        ESP_LOGW("Application", "wake confirm fetch failed: %s", msg.c_str());
+    };
+    ESP_LOGI("Application", "Fetching wake confirmation: \"%s\"",
+             CONFIG_OPENCLAW_WAKE_CONFIRM_TEXT);
+    client.Speak(CONFIG_OPENCLAW_WAKE_CONFIRM_TEXT, cb);
+
+    {
+        std::lock_guard<std::mutex> lock(g_wake_confirm_mutex);
+        g_wake_confirm_frames = std::move(frames);
+    }
+    g_wake_confirm_fetched.store(true);
+    g_wake_confirm_in_progress.store(false);
+    ESP_LOGI("Application", "Wake confirmation cached: %u Opus frames",
+             static_cast<unsigned>(g_wake_confirm_frames.size()));
+}
+
+static void PlayWakeConfirmation() {
+    // Empty text = feature disabled by user.
+    if (strlen(CONFIG_OPENCLAW_WAKE_CONFIRM_TEXT) == 0) return;
+
+    EnsureWakeConfirmationLoaded();
+
+    std::lock_guard<std::mutex> lock(g_wake_confirm_mutex);
+    if (g_wake_confirm_frames.empty()) return;
+
+    auto& audio = Application::GetInstance().GetAudioService();
+    for (const auto& opus_bytes : g_wake_confirm_frames) {
+        auto p = std::make_unique<AudioStreamPacket>();
+        p->sample_rate    = 24000;
+        p->frame_duration = 60;
+        p->payload        = opus_bytes;   // copy bytes; cache stays intact
+        audio.PushPacketToDecodeQueue(std::move(p), /*wait=*/true);
+    }
+    audio.WaitForPlaybackQueueEmpty();
+}
+#else
+static void PlayWakeConfirmation() {}
+#endif  // CONFIG_OPENCLAW_WAKE_CONFIRM_TEXT
+
 // Per-chunk average of |sample|. Cheap proxy for RMS for energy VAD.
 static int AverageAbsSample(const std::vector<int16_t>& chunk) {
     if (chunk.empty()) return 0;
@@ -1509,6 +1577,12 @@ static void OpenclawVoiceWorker(void* arg) {
     // If wake-word detection was running it was also reading the codec —
     // disable it while we record so there's no contention.
     audio.EnableWakeWordDetection(false);
+
+    // Acknowledge the trigger with a short voice prompt ("我在", "hi",
+    // ...) BEFORE recording starts, so the playback isn't captured back
+    // into the user's utterance. First call also fetches+caches the
+    // Opus frames; subsequent wakes play instantly from RAM.
+    PlayWakeConfirmation();
 
 #ifdef CONFIG_USE_OPENCLAW_VISION
     // Start the camera preview loop in parallel — it pushes frames into

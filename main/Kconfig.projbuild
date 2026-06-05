@@ -1190,6 +1190,26 @@ config OPENCLAW_VAD_RMS_THRESHOLD
         VAD is cutting you off too early; raise if background noise
         keeps recording alive forever.
 
+config OPENCLAW_WAKE_CONFIRM_TEXT
+    string "Wake-confirmation phrase TTS'd at first wake (empty = disabled)"
+    default "我在"
+    depends on USE_OPENCLAW_WAKE_WORD && USE_OPENCLAW_TTS
+    help
+        When wake word fires, the device plays this short phrase as a
+        "I heard you, go ahead" acknowledgment, BEFORE recording starts
+        so playback doesn't get captured into the user's utterance.
+
+        The first wake of each boot does a /v1/audio/speech round-trip
+        to fetch it (~500ms), then caches the Opus frames in PSRAM so
+        every subsequent wake plays instantly.
+
+        Common values:
+          中文: "我在", "嗯", "你说"
+          English: "hi", "yes", "go ahead"
+
+        Leave empty to disable the confirmation altogether — useful
+        when chaining quick wake-recoveries.
+
 config OPENCLAW_PREVIEW_FPS
     int "Camera preview frame rate during recording"
     default 10
