@@ -111,6 +111,14 @@ public:
     // POC: fire one streaming request to OpenClaw and render the reply on the
     // display. Safe to call from any task; internally schedules a worker.
     void TriggerOpenclawTest(const std::string& prompt);
+
+    // Voice path. StartOpenclawVoice spawns a worker that records PCM from
+    // the codec until StopOpenclawVoice is called; then it transcribes the
+    // audio via /v1/audio/transcriptions and streams the reply via
+    // /v1/responses (the same path as TriggerOpenclawTest above). Both are
+    // safe to call from any task (e.g. button callbacks).
+    void StartOpenclawVoice();
+    void StopOpenclawVoice();
 #endif
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();

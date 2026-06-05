@@ -205,3 +205,192 @@ bool OpenclawClient::ExtractDelta(const std::string& json, std::string* out) {
     cJSON_Delete(root);
     return ok;
 }
+
+namespace {
+
+// Build a minimal 44-byte RIFF/WAVE header for 16 kHz / 16-bit / mono PCM.
+void AppendWavHeader(std::string* out, uint32_t pcm_bytes) {
+    constexpr uint16_t kChannels  = 1;
+    constexpr uint32_t kSampleRate = 16000;
+    constexpr uint16_t kBitsPerSample = 16;
+    constexpr uint32_t kByteRate = kSampleRate * kChannels * kBitsPerSample / 8;
+    constexpr uint16_t kBlockAlign = kChannels * kBitsPerSample / 8;
+
+    auto u16 = [out](uint16_t v) {
+        char b[2] = { char(v & 0xff), char((v >> 8) & 0xff) };
+        out->append(b, 2);
+    };
+    auto u32 = [out](uint32_t v) {
+        char b[4] = {
+            char(v & 0xff), char((v >> 8) & 0xff),
+            char((v >> 16) & 0xff), char((v >> 24) & 0xff),
+        };
+        out->append(b, 4);
+    };
+
+    out->append("RIFF", 4);
+    u32(36 + pcm_bytes);   // ChunkSize
+    out->append("WAVE", 4);
+    out->append("fmt ", 4);
+    u32(16);               // Subchunk1Size
+    u16(1);                // AudioFormat = PCM
+    u16(kChannels);
+    u32(kSampleRate);
+    u32(kByteRate);
+    u16(kBlockAlign);
+    u16(kBitsPerSample);
+    out->append("data", 4);
+    u32(pcm_bytes);
+}
+
+}  // namespace
+
+bool OpenclawClient::Transcribe(const std::vector<int16_t>& pcm,
+                                std::string* text) {
+    text->clear();
+
+    if (pcm.empty()) {
+        ESP_LOGW(TAG, "Transcribe called with empty PCM");
+        return false;
+    }
+
+    const std::string boundary = "----ESP32OpenclawSTT";
+    const uint32_t pcm_bytes = static_cast<uint32_t>(pcm.size() * sizeof(int16_t));
+
+    // ----- build the multipart prologue (everything before raw PCM) -------
+    std::string prologue;
+    prologue.reserve(512 + 44);
+
+    auto add_field = [&](const char* name, const char* value) {
+        prologue += "--" + boundary + "\r\n";
+        prologue += "Content-Disposition: form-data; name=\"";
+        prologue += name;
+        prologue += "\"\r\n\r\n";
+        prologue += value;
+        prologue += "\r\n";
+    };
+
+    add_field("model",    "whisper-1");
+    add_field("language", "zh");
+
+    prologue += "--" + boundary + "\r\n";
+    prologue += "Content-Disposition: form-data; name=\"file\"; "
+                "filename=\"audio.wav\"\r\n";
+    prologue += "Content-Type: audio/wav\r\n\r\n";
+    AppendWavHeader(&prologue, pcm_bytes);
+
+    // ----- build the trailer (after raw PCM) ------------------------------
+    std::string epilogue = "\r\n--" + boundary + "--\r\n";
+
+    const size_t content_length = prologue.size() + pcm_bytes + epilogue.size();
+
+    const std::string url = "http://" + cfg_.host + ":"
+                          + std::to_string(cfg_.port)
+                          + "/v1/audio/transcriptions";
+
+    ESP_LOGI(TAG, "POST %s content-length=%u (%u PCM bytes ~ %.2fs)",
+             url.c_str(), static_cast<unsigned>(content_length),
+             static_cast<unsigned>(pcm_bytes), pcm_bytes / 32000.0f);
+
+    esp_http_client_config_t http_cfg = {};
+    http_cfg.url = url.c_str();
+    http_cfg.method = HTTP_METHOD_POST;
+    http_cfg.timeout_ms = 60000;
+    http_cfg.disable_auto_redirect = true;
+    http_cfg.buffer_size = 1024;
+    http_cfg.buffer_size_tx = 1024;
+
+    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
+    if (!client) {
+        ESP_LOGE(TAG, "esp_http_client_init failed");
+        return false;
+    }
+
+    const std::string content_type = "multipart/form-data; boundary=" + boundary;
+    esp_http_client_set_header(client, "Content-Type", content_type.c_str());
+    const std::string auth = "Bearer " + cfg_.token;
+    esp_http_client_set_header(client, "Authorization", auth.c_str());
+
+    bool ok = false;
+    do {
+        esp_err_t err = esp_http_client_open(client, content_length);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "open failed: %s", esp_err_to_name(err));
+            break;
+        }
+
+        int written = esp_http_client_write(client, prologue.data(),
+                                            prologue.size());
+        if (written != static_cast<int>(prologue.size())) {
+            ESP_LOGE(TAG, "write prologue failed: %d/%u", written,
+                     static_cast<unsigned>(prologue.size()));
+            break;
+        }
+
+        // Stream the PCM in small chunks so we don't have to allocate a giant
+        // contiguous send buffer.
+        const char* pcm_bytes_ptr = reinterpret_cast<const char*>(pcm.data());
+        size_t remaining = pcm_bytes;
+        const size_t kChunk = 2048;
+        bool pcm_ok = true;
+        while (remaining > 0) {
+            int n = static_cast<int>(remaining < kChunk ? remaining : kChunk);
+            int w = esp_http_client_write(client, pcm_bytes_ptr, n);
+            if (w != n) {
+                ESP_LOGE(TAG, "write pcm failed: %d/%d", w, n);
+                pcm_ok = false;
+                break;
+            }
+            pcm_bytes_ptr += n;
+            remaining -= n;
+        }
+        if (!pcm_ok) break;
+
+        int ew = esp_http_client_write(client, epilogue.data(),
+                                       epilogue.size());
+        if (ew != static_cast<int>(epilogue.size())) {
+            ESP_LOGE(TAG, "write epilogue failed: %d/%u", ew,
+                     static_cast<unsigned>(epilogue.size()));
+            break;
+        }
+
+        int64_t total = esp_http_client_fetch_headers(client);
+        int status   = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "STT response status=%d content-length=%lld",
+                 status, total);
+
+        std::string body;
+        body.reserve(256);
+        char buf[256];
+        while (true) {
+            int r = esp_http_client_read(client, buf, sizeof(buf));
+            if (r <= 0) break;
+            body.append(buf, r);
+        }
+
+        if (status < 200 || status >= 300) {
+            ESP_LOGE(TAG, "STT non-2xx: %d body=%.200s", status, body.c_str());
+            break;
+        }
+
+        cJSON* root = cJSON_Parse(body.c_str());
+        if (!root) {
+            ESP_LOGE(TAG, "STT response not JSON: %.200s", body.c_str());
+            break;
+        }
+        cJSON* t = cJSON_GetObjectItem(root, "text");
+        if (cJSON_IsString(t) && t->valuestring) {
+            text->assign(t->valuestring);
+            ok = true;
+            ESP_LOGI(TAG, "STT text=%s", text->c_str());
+        } else {
+            ESP_LOGE(TAG, "STT response missing 'text' field: %.200s",
+                     body.c_str());
+        }
+        cJSON_Delete(root);
+    } while (false);
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return ok;
+}

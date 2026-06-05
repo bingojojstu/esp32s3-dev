@@ -1172,21 +1172,17 @@ void Application::ResetProtocol() {
 #include "openclaw_client.h"
 
 namespace {
-// Heap-allocated job state passed into the worker task. The task owns it
-// and frees it on exit.
-struct OpenclawJob {
-    std::string prompt;
-};
 
-// Re-entrancy guard: at most one outstanding OpenClaw request at a time.
-// Long-press could otherwise spawn many tasks while one is still streaming.
+// Re-entrancy guard. The voice worker and the text "death-letter" worker
+// share this so a long-press during an in-flight reply is ignored cleanly.
 static std::atomic<bool> g_openclaw_in_flight{false};
 
-static void OpenclawWorker(void* arg) {
-    std::unique_ptr<OpenclawJob> job(static_cast<OpenclawJob*>(arg));
-    auto& board = Board::GetInstance();
-    auto* display = board.GetDisplay();
+// Voice recording state. Set true by StartOpenclawVoice (BOOT long-press),
+// cleared by StopOpenclawVoice (BOOT release). The worker watches it.
+static std::atomic<bool> g_voice_recording{false};
 
+// Build a config struct from Kconfig values; same shape for both paths.
+static OpenclawClient::Config MakeOpenclawConfig() {
     OpenclawClient::Config cfg;
     cfg.host = CONFIG_OPENCLAW_HOST;
     cfg.port = CONFIG_OPENCLAW_PORT;
@@ -1195,38 +1191,33 @@ static void OpenclawWorker(void* arg) {
     cfg.model = CONFIG_OPENCLAW_MODEL;
     cfg.user = CONFIG_OPENCLAW_USER;
     cfg.max_output_tokens = CONFIG_OPENCLAW_MAX_OUTPUT_TOKENS;
+    return cfg;
+}
 
-    OpenclawClient client(cfg);
-
-    if (display) {
-        display->SetChatMessage("user", job->prompt.c_str());
-    }
-
-    // POC: in multiline mode, SetChatMessage() creates a NEW bubble every
-    // call. Calling it per delta would spawn dozens of progressively-longer
-    // bubbles that look like garbled text on screen. So during streaming we
-    // only accumulate; the final reply is rendered once when [DONE] arrives.
-    // The streaming aspect is still visible in the serial log (one line per
-    // delta, see openclaw_client.cc).
-    auto* accumulated = new std::string();
-    auto* delta_count = new uint32_t(0);
+// Open SSE stream to /v1/responses, accumulate deltas, render final reply.
+// Returns when [DONE] fires or the stream errors out.
+static void StreamOpenclawReplyAndDisplay(OpenclawClient& client,
+                                          const std::string& user_text,
+                                          Display* display) {
+    std::string accumulated;
+    uint32_t delta_count = 0;
 
     OpenclawClient::Callbacks cb;
-    cb.on_delta = [accumulated, delta_count](const std::string& delta) {
-        accumulated->append(delta);
-        ++*delta_count;
+    cb.on_delta = [&accumulated, &delta_count](const std::string& delta) {
+        accumulated.append(delta);
+        ++delta_count;
     };
-    cb.on_done = [accumulated, delta_count, display]() {
+    cb.on_done = [&accumulated, &delta_count, display]() {
         ESP_LOGI("Application",
                  "OpenClaw reply complete: %u deltas, %u bytes total",
-                 static_cast<unsigned>(*delta_count),
-                 static_cast<unsigned>(accumulated->size()));
-        ESP_LOGI("Application", "Full reply: %s", accumulated->c_str());
+                 static_cast<unsigned>(delta_count),
+                 static_cast<unsigned>(accumulated.size()));
+        ESP_LOGI("Application", "Full reply: %s", accumulated.c_str());
         if (!display) return;
-        if (accumulated->empty()) {
+        if (accumulated.empty()) {
             display->SetChatMessage("assistant", "[empty response]");
         } else {
-            display->SetChatMessage("assistant", accumulated->c_str());
+            display->SetChatMessage("assistant", accumulated.c_str());
         }
     };
     cb.on_error = [display](const std::string& msg) {
@@ -1234,13 +1225,110 @@ static void OpenclawWorker(void* arg) {
         if (display) display->ShowNotification(msg.c_str(), 5000);
     };
 
-    client.Stream(job->prompt, cb);
-    delete accumulated;
-    delete delta_count;
+    client.Stream(user_text, cb);
+}
+
+// === Text path (BOOT short-press) ====================================
+struct OpenclawJob {
+    std::string prompt;
+};
+
+static void OpenclawTextWorker(void* arg) {
+    std::unique_ptr<OpenclawJob> job(static_cast<OpenclawJob*>(arg));
+    auto* display = Board::GetInstance().GetDisplay();
+
+    if (display) display->SetChatMessage("user", job->prompt.c_str());
+
+    OpenclawClient client(MakeOpenclawConfig());
+    StreamOpenclawReplyAndDisplay(client, job->prompt, display);
 
     g_openclaw_in_flight = false;
     vTaskDelete(nullptr);
 }
+
+// === Voice path (BOOT long-press) ====================================
+//
+// The whole round-trip (record -> STT -> stream reply) runs in one worker
+// task. Recording stops when g_voice_recording goes false (set by
+// StopOpenclawVoice from the BOOT release handler).
+
+static constexpr int kVoiceSampleRate     = 16000;
+static constexpr int kVoiceChunkSamples   = 1024;       // ~64 ms per chunk
+static constexpr int kVoiceMaxSeconds     = 15;
+static constexpr int kVoiceMaxSamples     = kVoiceSampleRate * kVoiceMaxSeconds;
+static constexpr int kVoiceMinSamples     = kVoiceSampleRate / 4;  // 0.25 s
+
+static void OpenclawVoiceWorker(void* arg) {
+    auto& app = Application::GetInstance();
+    auto& board = Board::GetInstance();
+    auto* display = board.GetDisplay();
+    auto& audio = app.GetAudioService();
+
+    if (display) {
+        display->ShowNotification("\xF0\x9F\x8E\xA4 Listening...", 30000);
+    }
+
+    // -------- Phase 1: record while the user holds BOOT ----------------
+    std::vector<int16_t> pcm;
+    pcm.reserve(kVoiceMaxSamples);
+
+    while (g_voice_recording.load() &&
+           static_cast<int>(pcm.size()) < kVoiceMaxSamples) {
+        std::vector<int16_t> chunk;
+        if (!audio.ReadAudioData(chunk, kVoiceSampleRate, kVoiceChunkSamples)) {
+            // ReadAudioData turns the codec on lazily; transient failures
+            // can happen during warm-up. Just retry.
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        pcm.insert(pcm.end(), chunk.begin(), chunk.end());
+    }
+
+    ESP_LOGI("Application",
+             "Voice capture done: %u samples (~%.2fs)",
+             static_cast<unsigned>(pcm.size()),
+             pcm.size() / float(kVoiceSampleRate));
+
+    if (display) display->DismissAlert();
+
+    if (static_cast<int>(pcm.size()) < kVoiceMinSamples) {
+        ESP_LOGW("Application", "Voice clip too short, ignoring");
+        if (display) display->ShowNotification("Too short", 2000);
+        g_openclaw_in_flight = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    // -------- Phase 2: STT ---------------------------------------------
+    if (display) display->ShowNotification("Transcribing...", 30000);
+
+    OpenclawClient client(MakeOpenclawConfig());
+    std::string text;
+    bool stt_ok = client.Transcribe(pcm, &text);
+    // Free PCM ASAP — Stream() will need RAM for SSE buffering.
+    pcm.clear();
+    pcm.shrink_to_fit();
+
+    if (display) display->DismissAlert();
+
+    if (!stt_ok || text.empty()) {
+        const char* msg = stt_ok ? "Empty transcription" : "STT failed";
+        ESP_LOGW("Application", "%s", msg);
+        if (display) display->ShowNotification(msg, 3000);
+        g_openclaw_in_flight = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    if (display) display->SetChatMessage("user", text.c_str());
+
+    // -------- Phase 3: stream LLM reply (same as text path) ------------
+    StreamOpenclawReplyAndDisplay(client, text, display);
+
+    g_openclaw_in_flight = false;
+    vTaskDelete(nullptr);
+}
+
 }  // namespace
 
 void Application::TriggerOpenclawTest(const std::string& prompt) {
@@ -1250,13 +1338,36 @@ void Application::TriggerOpenclawTest(const std::string& prompt) {
         return;
     }
     auto* job = new OpenclawJob{prompt};
-    BaseType_t ok = xTaskCreate(&OpenclawWorker, "openclaw",
+    BaseType_t ok = xTaskCreate(&OpenclawTextWorker, "openclaw_text",
                                 4096 * 2, job, 4, nullptr);
     if (ok != pdPASS) {
         delete job;
         g_openclaw_in_flight = false;
-        ESP_LOGE("Application", "Failed to spawn OpenClaw worker task");
+        ESP_LOGE("Application", "Failed to spawn OpenClaw text worker");
     }
+}
+
+void Application::StartOpenclawVoice() {
+    bool expected = false;
+    if (!g_openclaw_in_flight.compare_exchange_strong(expected, true)) {
+        ESP_LOGW("Application",
+                 "Voice ignored: another OpenClaw request is in flight");
+        return;
+    }
+    g_voice_recording.store(true);
+    BaseType_t ok = xTaskCreate(&OpenclawVoiceWorker, "openclaw_voice",
+                                4096 * 3, nullptr, 4, nullptr);
+    if (ok != pdPASS) {
+        g_voice_recording.store(false);
+        g_openclaw_in_flight = false;
+        ESP_LOGE("Application", "Failed to spawn OpenClaw voice worker");
+    }
+}
+
+void Application::StopOpenclawVoice() {
+    // Signal the worker. It finishes recording, then runs STT + LLM stream
+    // on its own thread. Safe to call from any task.
+    g_voice_recording.store(false);
 }
 #endif  // CONFIG_USE_OPENCLAW_BACKEND
 

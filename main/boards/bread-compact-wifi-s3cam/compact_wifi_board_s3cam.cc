@@ -66,6 +66,9 @@ private:
     Button boot_button_;
     LcdDisplay* display_;
     Esp32Camera* camera_;
+#ifdef CONFIG_USE_OPENCLAW_BACKEND
+    bool voice_active_ = false;   // true while BOOT is held for voice capture
+#endif
 
     void InitializeSpi() {
         spi_bus_config_t buscfg = {};
@@ -156,9 +159,17 @@ private:
 
     void InitializeButtons() {
 #ifdef CONFIG_USE_OPENCLAW_BACKEND
-        // POC: BOOT click sends a hard-coded test prompt to OpenClaw.
-        // The Xiaozhi protocol is not initialized in this mode, so the
-        // original ToggleChat path would crash.
+        // POC:
+        //   * Short click  -> send hard-coded test prompt (Phase 1 path,
+        //                     useful for verifying the network end of things
+        //                     without speaking).
+        //   * Long press   -> start recording. Hold to speak.
+        //   * Release      -> stop recording, transcribe, then stream reply.
+        //
+        // The iot_button library guarantees OnClick only fires for short
+        // presses; long presses skip OnClick and fire OnLongPress instead.
+        // OnPressUp fires on both, so we gate the "stop voice" path on
+        // whether voice was actually started.
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
@@ -166,6 +177,22 @@ private:
                 return;
             }
             app.TriggerOpenclawTest(CONFIG_OPENCLAW_TEST_PROMPT);
+        });
+        boot_button_.OnLongPress([this]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == kDeviceStateStarting) {
+                // Long-press during WiFi config -> enter config UI, not voice.
+                EnterWifiConfigMode();
+                return;
+            }
+            voice_active_ = true;
+            app.StartOpenclawVoice();
+        });
+        boot_button_.OnPressUp([this]() {
+            if (voice_active_) {
+                voice_active_ = false;
+                Application::GetInstance().StopOpenclawVoice();
+            }
         });
 #else
         boot_button_.OnClick([this]() {
@@ -181,7 +208,15 @@ private:
 
 public:
     CompactWifiBoardS3Cam() :
+#ifdef CONFIG_USE_OPENCLAW_BACKEND
+        // Push-to-talk UX: drop the long-press threshold so voice capture
+        // starts near-instantly when the user holds BOOT. The library
+        // default (1500 ms) feels broken for "hold to speak".
+        boot_button_(BOOT_BUTTON_GPIO, /*active_high=*/false,
+                     /*long_press_time_ms=*/300, /*short_press_time_ms=*/0) {
+#else
         boot_button_(BOOT_BUTTON_GPIO) {
+#endif
         InitializeSpi();
         InitializeLcdDisplay();
         InitializeButtons();

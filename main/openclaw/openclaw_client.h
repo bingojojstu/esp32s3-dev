@@ -60,6 +60,33 @@ public:
     // Returns true if stream ended with [DONE] cleanly.
     bool Stream(const std::string& input, const Callbacks& cb);
 
+    // Synchronous: POST raw PCM (16 kHz, 16-bit, mono) wrapped in a WAV
+    // container as multipart/form-data to /v1/audio/transcriptions. The
+    // recognised text is written into *text on success.
+    //
+    // OpenAI-compatible request:
+    //   POST /v1/audio/transcriptions
+    //   Authorization: Bearer <token>
+    //   Content-Type: multipart/form-data; boundary=...
+    //
+    //   --boundary
+    //   Content-Disposition: form-data; name="model"
+    //
+    //   whisper-1
+    //   --boundary
+    //   Content-Disposition: form-data; name="language"
+    //
+    //   zh
+    //   --boundary
+    //   Content-Disposition: form-data; name="file"; filename="audio.wav"
+    //   Content-Type: audio/wav
+    //
+    //   <WAV bytes>
+    //   --boundary--
+    //
+    // Reply: { "text": "..." }
+    bool Transcribe(const std::vector<int16_t>& pcm, std::string* text);
+
 private:
     // Forward decl to keep esp_http_client.h out of the header.
     struct HttpEvent;
