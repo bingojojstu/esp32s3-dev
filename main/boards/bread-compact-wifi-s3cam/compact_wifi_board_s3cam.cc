@@ -155,6 +155,12 @@ private:
         config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
         camera_ = new Esp32Camera(config);
         camera_->SetHMirror(false);
+        // OV3660 on the bread-compact board sits upside-down relative to
+        // the LCD's natural orientation, which Kimi/VLM models reliably
+        // notice and complain about ("上下颠倒"). Flip vertically so the
+        // model — and the live preview on the LCD — see the world the
+        // right way up.
+        camera_->SetVFlip(true);
     }
 
     void InitializeButtons() {
