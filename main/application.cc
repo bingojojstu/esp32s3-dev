@@ -11,11 +11,16 @@
 #include "settings.h"
 
 #include <cstring>
+#include <atomic>
 #include <esp_log.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
 #include <arpa/inet.h>
 #include <font_awesome.h>
+#ifdef CONFIG_USE_OPENCLAW_BACKEND
+#include <esp_netif_sntp.h>
+#include <esp_sntp.h>
+#endif
 
 #define TAG "Application"
 
@@ -321,6 +326,39 @@ void Application::HandleActivationDoneEvent() {
 }
 
 void Application::ActivationTask() {
+#ifdef CONFIG_USE_OPENCLAW_BACKEND
+    // POC mode: bypass Xiaozhi cloud entirely. No OTA check, no activation
+    // handshake, no chat protocol. The device just goes idle and waits for
+    // BOOT-press to fire an OpenClaw HTTP request.
+    //
+    // Sync wall-clock time from public NTP so logs aren't stuck in 1970 and
+    // any component that timestamps records (audio_debugger, TLS, etc.)
+    // sees a sane year. Non-fatal if it fails — we just keep going.
+    {
+        esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+        sntp_cfg.start = true;
+        esp_err_t err = esp_netif_sntp_init(&sntp_cfg);
+        if (err == ESP_OK) {
+            // Wait up to 5s for first sync; don't block boot forever.
+            if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(5000)) == ESP_OK) {
+                ESP_LOGI("Application", "SNTP time synced");
+            } else {
+                ESP_LOGW("Application", "SNTP did not sync in 5s (continuing)");
+            }
+        } else {
+            ESP_LOGW("Application", "esp_netif_sntp_init failed: %s",
+                     esp_err_to_name(err));
+        }
+    }
+
+    // We still create a dummy Ota object only so HandleActivationDoneEvent()
+    // can read GetCurrentVersion() without crashing.
+    ota_ = std::make_unique<Ota>();
+    has_server_time_ = true;
+    ESP_LOGW("Application", "OpenClaw backend enabled — skipping Xiaozhi activation");
+    xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
+    return;
+#else
     // Create OTA object for activation process
     ota_ = std::make_unique<Ota>();
 
@@ -335,6 +373,7 @@ void Application::ActivationTask() {
 
     // Signal completion to main loop
     xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
+#endif
 }
 
 void Application::CheckAssetsVersion() {
@@ -1128,4 +1167,96 @@ void Application::ResetProtocol() {
         protocol_.reset();
     });
 }
+
+#ifdef CONFIG_USE_OPENCLAW_BACKEND
+#include "openclaw_client.h"
+
+namespace {
+// Heap-allocated job state passed into the worker task. The task owns it
+// and frees it on exit.
+struct OpenclawJob {
+    std::string prompt;
+};
+
+// Re-entrancy guard: at most one outstanding OpenClaw request at a time.
+// Long-press could otherwise spawn many tasks while one is still streaming.
+static std::atomic<bool> g_openclaw_in_flight{false};
+
+static void OpenclawWorker(void* arg) {
+    std::unique_ptr<OpenclawJob> job(static_cast<OpenclawJob*>(arg));
+    auto& board = Board::GetInstance();
+    auto* display = board.GetDisplay();
+
+    OpenclawClient::Config cfg;
+    cfg.host = CONFIG_OPENCLAW_HOST;
+    cfg.port = CONFIG_OPENCLAW_PORT;
+    cfg.token = CONFIG_OPENCLAW_TOKEN;
+    cfg.agent_id = CONFIG_OPENCLAW_AGENT_ID;
+    cfg.model = CONFIG_OPENCLAW_MODEL;
+    cfg.user = CONFIG_OPENCLAW_USER;
+    cfg.max_output_tokens = CONFIG_OPENCLAW_MAX_OUTPUT_TOKENS;
+
+    OpenclawClient client(cfg);
+
+    if (display) {
+        display->SetChatMessage("user", job->prompt.c_str());
+    }
+
+    // POC: in multiline mode, SetChatMessage() creates a NEW bubble every
+    // call. Calling it per delta would spawn dozens of progressively-longer
+    // bubbles that look like garbled text on screen. So during streaming we
+    // only accumulate; the final reply is rendered once when [DONE] arrives.
+    // The streaming aspect is still visible in the serial log (one line per
+    // delta, see openclaw_client.cc).
+    auto* accumulated = new std::string();
+    auto* delta_count = new uint32_t(0);
+
+    OpenclawClient::Callbacks cb;
+    cb.on_delta = [accumulated, delta_count](const std::string& delta) {
+        accumulated->append(delta);
+        ++*delta_count;
+    };
+    cb.on_done = [accumulated, delta_count, display]() {
+        ESP_LOGI("Application",
+                 "OpenClaw reply complete: %u deltas, %u bytes total",
+                 static_cast<unsigned>(*delta_count),
+                 static_cast<unsigned>(accumulated->size()));
+        ESP_LOGI("Application", "Full reply: %s", accumulated->c_str());
+        if (!display) return;
+        if (accumulated->empty()) {
+            display->SetChatMessage("assistant", "[empty response]");
+        } else {
+            display->SetChatMessage("assistant", accumulated->c_str());
+        }
+    };
+    cb.on_error = [display](const std::string& msg) {
+        ESP_LOGE("Application", "OpenClaw error: %s", msg.c_str());
+        if (display) display->ShowNotification(msg.c_str(), 5000);
+    };
+
+    client.Stream(job->prompt, cb);
+    delete accumulated;
+    delete delta_count;
+
+    g_openclaw_in_flight = false;
+    vTaskDelete(nullptr);
+}
+}  // namespace
+
+void Application::TriggerOpenclawTest(const std::string& prompt) {
+    bool expected = false;
+    if (!g_openclaw_in_flight.compare_exchange_strong(expected, true)) {
+        ESP_LOGW("Application", "OpenClaw request already in flight, ignoring");
+        return;
+    }
+    auto* job = new OpenclawJob{prompt};
+    BaseType_t ok = xTaskCreate(&OpenclawWorker, "openclaw",
+                                4096 * 2, job, 4, nullptr);
+    if (ok != pdPASS) {
+        delete job;
+        g_openclaw_in_flight = false;
+        ESP_LOGE("Application", "Failed to spawn OpenClaw worker task");
+    }
+}
+#endif  // CONFIG_USE_OPENCLAW_BACKEND
 

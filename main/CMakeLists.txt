@@ -29,6 +29,7 @@ set(SOURCES "audio/audio_codec.cc"
             "protocols/protocol.cc"
             "protocols/mqtt_protocol.cc"
             "protocols/websocket_protocol.cc"
+            "openclaw/openclaw_client.cc"
             "mcp_server.cc"
             "system_info.cc"
             "application.cc"
@@ -39,7 +40,7 @@ set(SOURCES "audio/audio_codec.cc"
             "main.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols")
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "openclaw")
 
 # Add board common files
 list(APPEND SOURCES
@@ -780,7 +781,10 @@ elseif(CONFIG_BOARD_TYPE_ELECTRON_BOT)
     set(DEFAULT_EMOJI_COLLECTION otto-gif)
 elseif(CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI_CAM)
     set(BOARD_TYPE "bread-compact-wifi-s3cam")
-    set(BUILTIN_TEXT_FONT font_puhui_basic_16_4)
+    # Use full puhui (not "basic") so all common CJK glyphs render — basic
+    # subset misses words like 私人/记住/任 which made OpenClaw replies
+    # show holes on screen even though the bytes arrived correctly.
+    set(BUILTIN_TEXT_FONT font_puhui_16_4)
     set(BUILTIN_ICON_FONT font_awesome_16_4)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
 elseif(CONFIG_BOARD_TYPE_JIUCHUAN)
@@ -1029,6 +1033,8 @@ idf_component_register(SRCS ${SOURCES}
                         efuse
                         bt
                         fatfs
+                        esp_http_client
+                        lwip
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 

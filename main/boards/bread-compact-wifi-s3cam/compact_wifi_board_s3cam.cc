@@ -155,6 +155,19 @@ private:
     }
 
     void InitializeButtons() {
+#ifdef CONFIG_USE_OPENCLAW_BACKEND
+        // POC: BOOT click sends a hard-coded test prompt to OpenClaw.
+        // The Xiaozhi protocol is not initialized in this mode, so the
+        // original ToggleChat path would crash.
+        boot_button_.OnClick([this]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == kDeviceStateStarting) {
+                EnterWifiConfigMode();
+                return;
+            }
+            app.TriggerOpenclawTest(CONFIG_OPENCLAW_TEST_PROMPT);
+        });
+#else
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
@@ -163,6 +176,7 @@ private:
             }
             app.ToggleChatState();
         });
+#endif
     }
 
 public:

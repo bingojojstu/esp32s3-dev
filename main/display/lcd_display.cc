@@ -553,8 +553,18 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
             }
         }
     } else {
-        // Hide the centered AI logo
-        lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        // Hide the entire centered emoji container. emoji_box_ wraps both
+        // emoji_label_ (font glyph) and emoji_image_ (PNG/GIF). Hiding only
+        // the children leaves the parent visible with stale image content,
+        // which is what produced the lingering circle in the middle of the
+        // screen. Also stop any running GIF animation.
+        if (emoji_box_ != nullptr) {
+            lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (gif_controller_) {
+            gif_controller_->Stop();
+            gif_controller_.reset();
+        }
     }
 
     // Avoid empty message boxes
@@ -1048,6 +1058,20 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
             lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
         } else if (!hide_subtitle_) {
             lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    // Hide the centered AI logo whenever a non-system message is displayed,
+    // so the multiline chat text can occupy the middle area cleanly. The
+    // logo comes back on the next SetEmotion() call (e.g. when the state
+    // machine returns to Idle and re-asserts "neutral" or another emotion).
+    if (role != nullptr && strcmp(role, "system") != 0 &&
+        content != nullptr && content[0] != '\0') {
+        if (emoji_box_ != nullptr) {
+            lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (gif_controller_) {
+            gif_controller_->Stop();
+            gif_controller_.reset();
         }
     }
 #if CONFIG_USE_MULTILINE_CHAT_MESSAGE

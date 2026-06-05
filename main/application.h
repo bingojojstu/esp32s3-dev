@@ -106,6 +106,12 @@ public:
 
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
+
+#ifdef CONFIG_USE_OPENCLAW_BACKEND
+    // POC: fire one streaming request to OpenClaw and render the reply on the
+    // display. Safe to call from any task; internally schedules a worker.
+    void TriggerOpenclawTest(const std::string& prompt);
+#endif
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();
     void SendMcpMessage(const std::string& payload);

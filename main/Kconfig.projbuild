@@ -983,4 +983,62 @@ menu "TAIJIPAI_S3_CONFIG"
         启动双声道
 endmenu
 
+#
+# === OpenClaw LAN backend (POC) =======================================
+# When enabled, the device skips Xiaozhi OTA/activation/protocol entirely
+# and instead talks to an OpenClaw gateway on the local network using
+# the OpenAI-Responses-compatible /v1/responses endpoint.
+#
+config USE_OPENCLAW_BACKEND
+    bool "Use OpenClaw LAN backend instead of Xiaozhi cloud"
+    default n
+    help
+        Enable to redirect this device to a self-hosted OpenClaw gateway
+        on the LAN. When set, the firmware does NOT call the Xiaozhi
+        activation server, does NOT open a WebSocket/MQTT protocol
+        channel, and re-binds the BOOT button to trigger a test request
+        to OpenClaw whose streaming reply is rendered on the display.
+
+config OPENCLAW_HOST
+    string "OpenClaw host (IP or DNS name)"
+    default "192.168.86.25"
+    depends on USE_OPENCLAW_BACKEND
+
+config OPENCLAW_PORT
+    int "OpenClaw port"
+    default 18789
+    depends on USE_OPENCLAW_BACKEND
+
+config OPENCLAW_TOKEN
+    string "OpenClaw bearer token"
+    default ""
+    depends on USE_OPENCLAW_BACKEND
+    help
+        Value passed as 'Authorization: Bearer <token>'.
+
+config OPENCLAW_AGENT_ID
+    string "x-openclaw-agent-id"
+    default "main"
+    depends on USE_OPENCLAW_BACKEND
+
+config OPENCLAW_MODEL
+    string "x-openclaw-model (leave empty to use gateway default)"
+    default "deepseek/deepseek-v4-flash"
+    depends on USE_OPENCLAW_BACKEND
+
+config OPENCLAW_USER
+    string "Session user id (preserves conversation context)"
+    default "esp32"
+    depends on USE_OPENCLAW_BACKEND
+
+config OPENCLAW_MAX_OUTPUT_TOKENS
+    int "Max output tokens per response"
+    default 200
+    depends on USE_OPENCLAW_BACKEND
+
+config OPENCLAW_TEST_PROMPT
+    string "Prompt fired by BOOT button press in POC mode"
+    default "你好，请简短地介绍一下你自己。"
+    depends on USE_OPENCLAW_BACKEND
+
 endmenu
