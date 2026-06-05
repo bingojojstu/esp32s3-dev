@@ -188,8 +188,14 @@ void OpenclawClient::ParseSseLine(const std::string& line) {
 void OpenclawClient::DispatchEvent() {
     if (current_data_.empty() && current_event_.empty()) return;
 
-    // Stream terminator
-    if (current_data_ == "[DONE]") {
+    // Stream terminators — different endpoints signal "end of response"
+    // differently:
+    //   /v1/responses  -> "data: [DONE]"
+    //   /v1/vision     -> "event: response.completed"
+    // We accept either so the same parser works for both. (HTTP body
+    // closure is a third implicit signal; on_done in the caller fires
+    // regardless of which terminator hit.)
+    if (current_data_ == "[DONE]" || current_event_ == "response.completed") {
         done_ = true;
         current_event_.clear();
         current_data_.clear();
