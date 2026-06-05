@@ -119,6 +119,12 @@ public:
     // safe to call from any task (e.g. button callbacks).
     void StartOpenclawVoice();
     void StopOpenclawVoice();
+
+    // OpenClaw uses the `user` field as the session key — same user across
+    // requests means the agent keeps remembering. ResetOpenclawSession()
+    // bumps a counter that gets appended to CONFIG_OPENCLAW_USER, so the
+    // next request lands in a fresh session. Idempotent and thread-safe.
+    void ResetOpenclawSession();
 #endif
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();

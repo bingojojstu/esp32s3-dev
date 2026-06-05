@@ -1181,6 +1181,23 @@ static std::atomic<bool> g_openclaw_in_flight{false};
 // cleared by StopOpenclawVoice (BOOT release). The worker watches it.
 static std::atomic<bool> g_voice_recording{false};
 
+// Session counter. CONFIG_OPENCLAW_USER is the base; we suffix this counter
+// onto it so the same firmware can start fresh conversations on demand.
+// Bumped by Application::ResetOpenclawSession(); read by MakeOpenclawConfig.
+// Starts at 0 == bare CONFIG_OPENCLAW_USER (so first boot picks up wherever
+// the previous boot left off — matches Phase 1 behavior).
+static std::atomic<uint32_t> g_openclaw_session_seq{0};
+
+static std::string CurrentOpenclawUserId() {
+    uint32_t seq = g_openclaw_session_seq.load();
+    if (seq == 0) {
+        return CONFIG_OPENCLAW_USER;
+    }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s-s%u", CONFIG_OPENCLAW_USER, seq);
+    return buf;
+}
+
 // Build a config struct from Kconfig values; same shape for both paths.
 static OpenclawClient::Config MakeOpenclawConfig() {
     OpenclawClient::Config cfg;
@@ -1189,7 +1206,7 @@ static OpenclawClient::Config MakeOpenclawConfig() {
     cfg.token = CONFIG_OPENCLAW_TOKEN;
     cfg.agent_id = CONFIG_OPENCLAW_AGENT_ID;
     cfg.model = CONFIG_OPENCLAW_MODEL;
-    cfg.user = CONFIG_OPENCLAW_USER;
+    cfg.user = CurrentOpenclawUserId();
     cfg.max_output_tokens = CONFIG_OPENCLAW_MAX_OUTPUT_TOKENS;
     return cfg;
 }
@@ -1364,6 +1381,19 @@ void Application::StopOpenclawVoice() {
     // Signal the worker. It finishes recording, then runs STT + LLM stream
     // on its own thread. Safe to call from any task.
     g_voice_recording.store(false);
+}
+
+void Application::ResetOpenclawSession() {
+    uint32_t next = g_openclaw_session_seq.fetch_add(1) + 1;
+    std::string new_id = std::string(CONFIG_OPENCLAW_USER) + "-s" + std::to_string(next);
+    ESP_LOGI("Application", "OpenClaw session reset -> %s", new_id.c_str());
+    auto* display = Board::GetInstance().GetDisplay();
+    if (display) {
+        std::string msg = "New session: " + new_id;
+        display->ShowNotification(msg.c_str(), 3000);
+        // Also clear the visible chat so it's obvious context was wiped.
+        display->ClearChatMessages();
+    }
 }
 #endif  // CONFIG_USE_OPENCLAW_BACKEND
 

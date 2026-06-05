@@ -194,6 +194,11 @@ private:
                 Application::GetInstance().StopOpenclawVoice();
             }
         });
+        // Double-click = start a fresh OpenClaw session (forget context).
+        // Useful when switching topics or after a botched conversation.
+        boot_button_.OnDoubleClick([]() {
+            Application::GetInstance().ResetOpenclawSession();
+        });
 #else
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
