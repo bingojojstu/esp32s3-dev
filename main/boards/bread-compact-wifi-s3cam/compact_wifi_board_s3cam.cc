@@ -171,6 +171,7 @@ private:
         // OnPressUp fires on both, so we gate the "stop voice" path on
         // whether voice was actually started.
         boot_button_.OnClick([this]() {
+            ESP_LOGI("Button", "single_click");
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
@@ -179,6 +180,7 @@ private:
             app.TriggerOpenclawTest(CONFIG_OPENCLAW_TEST_PROMPT);
         });
         boot_button_.OnLongPress([this]() {
+            ESP_LOGI("Button", "long_press");
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 // Long-press during WiFi config -> enter config UI, not voice.
@@ -189,6 +191,7 @@ private:
             app.StartOpenclawVoice();
         });
         boot_button_.OnPressUp([this]() {
+            ESP_LOGI("Button", "press_up");
             if (voice_active_) {
                 voice_active_ = false;
                 Application::GetInstance().StopOpenclawVoice();
@@ -197,6 +200,7 @@ private:
         // Double-click = start a fresh OpenClaw session (forget context).
         // Useful when switching topics or after a botched conversation.
         boot_button_.OnDoubleClick([]() {
+            ESP_LOGI("Button", "double_click");
             Application::GetInstance().ResetOpenclawSession();
         });
 #else
@@ -214,11 +218,15 @@ private:
 public:
     CompactWifiBoardS3Cam() :
 #ifdef CONFIG_USE_OPENCLAW_BACKEND
-        // Push-to-talk UX: drop the long-press threshold so voice capture
-        // starts near-instantly when the user holds BOOT. The library
-        // default (1500 ms) feels broken for "hold to speak".
+        // Push-to-talk UX: drop long-press threshold so voice capture
+        // feels responsive, but keep enough headroom above short_press
+        // for double-click detection. iot_button's BUTTON_DOUBLE_CLICK
+        // event needs short_press_time as the "wait for the 2nd press"
+        // window — leaving it 0 makes the library fire SINGLE_CLICK
+        // instantly on release and double-click can't latch.
         boot_button_(BOOT_BUTTON_GPIO, /*active_high=*/false,
-                     /*long_press_time_ms=*/300, /*short_press_time_ms=*/0) {
+                     /*long_press_time_ms=*/500,
+                     /*short_press_time_ms=*/250) {
 #else
         boot_button_(BOOT_BUTTON_GPIO) {
 #endif
