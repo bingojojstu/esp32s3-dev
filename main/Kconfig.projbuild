@@ -1212,14 +1212,16 @@ config OPENCLAW_WAKE_CONFIRM_TEXT
 
 config OPENCLAW_PREVIEW_FPS
     int "Camera preview frame rate during recording"
-    default 10
+    default 5
     range 1 30
     depends on USE_OPENCLAW_VISION
     help
         Live camera preview frames are shown on the LCD while recording
-        so the user can see "what the device sees". 10 fps feels smooth
-        without dominating CPU. Raise toward 20 for smoother preview
-        (more CPU, less PSRAM headroom); lower toward 5 to save power.
+        so the user can see "what the device sees". 5 fps is the safe
+        default: smooth enough to feel "live", light enough that OV3660
+        DMA + microphone DMA + WiFi reliably coexist without the
+        camera HAL timing out. Raise to 10-15 for smoother preview on
+        boards with bigger PSRAM; lower to 2-3 to save power.
 
 
 config OPENCLAW_OUTPUT_VOLUME

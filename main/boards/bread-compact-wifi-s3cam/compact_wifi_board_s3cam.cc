@@ -150,9 +150,16 @@ private:
         config.pixel_format = PIXFORMAT_RGB565;
         config.frame_size = FRAMESIZE_VGA;
         config.jpeg_quality = 12;
-        config.fb_count = 1;
+        // 2 framebuffers give DMA room to fill the next frame while the
+        // app reads the current one — single-buffer mode was reliably
+        // timing out when the live-preview loop sustained 10 fps reads
+        // alongside an active microphone recording task. PSRAM cost: ~600
+        // KB instead of ~300 KB, negligible against 8 MB total.
+        config.fb_count = 2;
         config.fb_location = CAMERA_FB_IN_PSRAM;
-        config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+        // GRAB_LATEST drops stale frames eagerly so the preview shows
+        // "what the camera sees right now" rather than a backlog.
+        config.grab_mode = CAMERA_GRAB_LATEST;
         camera_ = new Esp32Camera(config);
         camera_->SetHMirror(false);
         // OV3660 on the bread-compact board sits upside-down relative to

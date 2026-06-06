@@ -367,6 +367,16 @@ void Application::ActivationTask() {
     ota_ = std::make_unique<Ota>();
     has_server_time_ = true;
     ESP_LOGW("Application", "OpenClaw backend enabled — skipping Xiaozhi activation");
+
+    // CRITICAL: even in OpenClaw mode we must apply assets so that the
+    // wake-word model (mn7_cn for MultiNet, wn9_xxx for AFE) is loaded
+    // and registered with AudioService. Without this, AudioService never
+    // gets a srmodel_list_t, never news up wake_word_, and the wake word
+    // path is silently dead. We skip ONLY the activation/network/protocol
+    // parts of CheckAssetsVersion (which we don't use), not the model
+    // load itself.
+    CheckAssetsVersion();
+
     xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
     return;
 #else
@@ -1293,16 +1303,16 @@ static void OpenclawPreviewTask(void*) {
 //   * CONFIG_OPENCLAW_ALWAYS_ATTACH_IMAGE is set, OR
 //   * the STT transcript contains a vision keyword.
 static std::string FinalizeVisionAfterRecording(const std::string& stt_text) {
-    // Tell preview to stop and wait for it.
+    // Tell preview to stop and wait for it. Wait LONGER than the camera
+    // HAL's internal timeout (typical ~1500 ms) so a stuck Capture()
+    // call has time to unwind — otherwise calling CaptureToJpeg() right
+    // away would put TWO tasks into esp_camera_fb_get() at once and
+    // wedge the HAL.
     g_preview_active.store(false);
     int waited = 0;
-    while (g_preview_running.load() && waited < 500) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        waited += 10;
-    }
-    if (g_preview_running.load()) {
-        ESP_LOGW("Application",
-                 "preview task didn't exit after 500ms; proceeding anyway");
+    while (g_preview_running.load() && waited < 2500) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        waited += 20;
     }
 
 #ifdef CONFIG_OPENCLAW_ALWAYS_ATTACH_IMAGE
@@ -1311,6 +1321,17 @@ static std::string FinalizeVisionAfterRecording(const std::string& stt_text) {
     const bool want_image = TextHasVisionKeyword(stt_text);
 #endif
     if (!want_image) return "";
+
+    if (g_preview_running.load()) {
+        // Preview task is wedged on a Camera::Capture() call. Touching
+        // the camera now would race with it and almost certainly wedge
+        // the HAL further. Abort the vision path for this round; the
+        // text query still goes through.
+        ESP_LOGW("Application",
+                 "preview task still running after 2.5s — skipping image "
+                 "attachment to avoid camera HAL contention");
+        return "";
+    }
 
     auto* camera = Board::GetInstance().GetCamera();
     if (camera == nullptr) return "";
