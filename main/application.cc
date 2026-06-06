@@ -1440,7 +1440,19 @@ static std::string StreamOpenclawReplyAndDisplay(
         if (display) display->ShowNotification(msg.c_str(), 5000);
     };
 
-    client.Stream(user_text, cb, opts);
+    bool ok = client.Stream(user_text, cb, opts);
+
+    // Belt-and-suspenders: if the stream errored out mid-flight (e.g. the
+    // server hung at 60s, ESP_ERR_HTTP_INCOMPLETE_DATA), the on_done
+    // callback never fires — so the chat bubble would never appear AND
+    // the centered emoji wouldn't get hidden either, despite us having
+    // collected partial reply text. Force a final display update here.
+    if (!ok && display && !accumulated.empty()) {
+        ESP_LOGW("Application",
+                 "Stream ended abnormally; rendering partial reply (%u bytes)",
+                 static_cast<unsigned>(accumulated.size()));
+        display->SetChatMessage("assistant", accumulated.c_str());
+    }
     return accumulated;
 }
 
