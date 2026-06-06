@@ -133,10 +133,13 @@ void CustomWakeWord::OnWakeWordDetected(std::function<void(const std::string& wa
 }
 
 void CustomWakeWord::Start() {
+    ESP_LOGI(TAG, "Start(): running_ -> true, threshold=%.3f, lang=%s",
+             threshold_, language_.c_str());
     running_ = true;
 }
 
 void CustomWakeWord::Stop() {
+    ESP_LOGI(TAG, "Stop(): running_ -> false");
     running_ = false;
 
     std::lock_guard<std::mutex> lock(input_buffer_mutex_);
@@ -145,13 +148,33 @@ void CustomWakeWord::Stop() {
 
 void CustomWakeWord::Feed(const std::vector<int16_t>& data) {
     if (multinet_model_data_ == nullptr) {
+        // Log this once per process at most so a misconfigured boot is
+        // obvious in the serial log.
+        static bool once = false;
+        if (!once) {
+            ESP_LOGE(TAG, "Feed called but multinet_model_data_ is NULL");
+            once = true;
+        }
         return;
     }
 
     std::lock_guard<std::mutex> lock(input_buffer_mutex_);
-    // Check running state inside lock to avoid TOCTOU race with Stop()
     if (!running_) {
         return;
+    }
+
+    // Diagnostic: ~once every 3 seconds (50 chunks @ 64ms each), report
+    // that data is flowing AND the audio-energy level so we can tell the
+    // mic from "silent room" apart from "mic dead".
+    static uint32_t feed_calls = 0;
+    feed_calls++;
+    if (feed_calls % 50 == 1) {
+        int64_t sum_abs = 0;
+        for (int16_t s : data) sum_abs += (s < 0 ? -s : s);
+        int avg_abs = data.empty() ? 0 : static_cast<int>(sum_abs / data.size());
+        ESP_LOGI(TAG, "Feed[#%u]: running=%d audio_avg_abs=%d buffer=%u",
+                 static_cast<unsigned>(feed_calls), running_ ? 1 : 0,
+                 avg_abs, static_cast<unsigned>(input_buffer_.size()));
     }
 
     // If input channels is 2, we need to fetch the left channel data
@@ -162,14 +185,24 @@ void CustomWakeWord::Feed(const std::vector<int16_t>& data) {
     } else {
         input_buffer_.insert(input_buffer_.end(), data.begin(), data.end());
     }
-    
+
     int chunksize = multinet_->get_samp_chunksize(multinet_model_data_);
+    static esp_mn_state_t last_state = ESP_MN_STATE_DETECTING;
     while (input_buffer_.size() >= chunksize) {
         std::vector<int16_t> chunk(input_buffer_.begin(), input_buffer_.begin() + chunksize);
         StoreWakeWordData(chunk);
-        
+
         esp_mn_state_t mn_state = multinet_->detect(multinet_model_data_, chunk.data());
-        
+
+        if (mn_state != last_state) {
+            const char* state_name =
+                (mn_state == ESP_MN_STATE_DETECTING) ? "DETECTING" :
+                (mn_state == ESP_MN_STATE_DETECTED)  ? "DETECTED"  :
+                (mn_state == ESP_MN_STATE_TIMEOUT)   ? "TIMEOUT"   : "UNKNOWN";
+            ESP_LOGI(TAG, "MultiNet state -> %s", state_name);
+            last_state = mn_state;
+        }
+
         if (mn_state == ESP_MN_STATE_DETECTED) {
             esp_mn_results_t *mn_result = multinet_->get_results(multinet_model_data_);
             for (int i = 0; i < mn_result->num && running_; i++) {
